@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sushitruck"
+version = "0.2.0"
+description = "A streaming ingestion and API connector toolkit — the conveyor belt of the data pipeline."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "sgtidwell" }]
+keywords = ["data-ingestion", "etl", "api-client", "streaming", "pandas"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pandas>=1.5",
+    "numpy>=1.23",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov", "responses>=0.23", "build", "twine"]
+kafka = ["confluent-kafka>=2.0"]
+kinesis = ["boto3>=1.26"]
+cloud = ["boto3>=1.26", "google-cloud-storage>=2.0"]
+websocket = ["websockets>=11.0"]
+all = ["sushitruck[kafka,kinesis,cloud,websocket]"]
+
+[project.urls]
+Homepage = "https://github.com/sgtidwellgit/SushiTruck"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sushitruck"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
