@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sushitruck"
-version = "0.2.0"
+version = "0.2.1"
 description = "A streaming ingestion and API connector toolkit — the conveyor belt of the data pipeline."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -40,6 +40,16 @@ all = ["sushitruck[kafka,kinesis,cloud,websocket]"]
 
 [project.urls]
 Homepage = "https://github.com/sgtidwellgit/SushiTruck"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/",
+    "tests/",
+    "README.md",
+    "CHANGELOG.md",
+    "PROJECT.md",
+    "pyproject.toml",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sushitruck"]
