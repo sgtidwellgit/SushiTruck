@@ -127,3 +127,42 @@ def test_normalize_does_not_warn_when_columns_match():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         wasabi.normalize(df, {"price": {"dtype": float}})
+
+
+def test_batch_normalizer_warns_once_even_when_extra_columns_vary():
+    import warnings
+
+    normalize = wasabi._BatchNormalizer({"price": {"dtype": float}})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(3):
+            out = normalize(pd.DataFrame({"price": ["1"], "a": [1]}))
+        normalize(pd.DataFrame({"price": ["1"], "b": [1]}))
+
+    messages = [str(w.message) for w in caught]
+    assert len(messages) == 1
+    assert "'a'" in messages[0] and "shown once" in messages[0]
+    assert out["price"].dtype == float
+
+
+def test_extra_columns_warning_lists_at_most_ten_names():
+    df = pd.DataFrame({"keep": [1], **{f"c{i:02d}": [i] for i in range(25)}})
+
+    with pytest.warns(UserWarning) as record:
+        wasabi.normalize(df, {"keep": {"dtype": int}})
+
+    message = str(record[0].message)
+    assert "'c09'" in message and "'c10'" not in message
+    assert message.endswith("and 15 more")
+
+
+def test_normalize_still_warns_on_every_direct_call():
+    import warnings
+
+    df = pd.DataFrame({"price": ["1"], "a": [1]})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        wasabi.normalize(df, {"price": {"dtype": float}})
+        wasabi.normalize(df, {"price": {"dtype": float}})
+
+    assert len(caught) == 2

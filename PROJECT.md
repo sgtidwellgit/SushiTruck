@@ -1,6 +1,6 @@
 # SushiTruck — Project Document
 
-> **Current version:** 0.2.3 | **Python:** ≥ 3.9 (CI: 3.9–3.13) | **Status:** Beta — all modules implemented
+> **Current version:** 2026.10.9 (date-based) | **Python:** ≥ 3.9 (CI: 3.9–3.13) | **Status:** Beta — all modules implemented
 
 ---
 
@@ -71,12 +71,12 @@ The guiding design values:
 | Item | Status |
 |---|---|
 | PyPI name `sushitruck` | Secured (2026-06-15) |
-| Version | 0.2.3 |
-| `src/sushitruck/__init__.py` | Exists — `__version__ = "0.2.3"`, exports all seven modules + `MakiClient`, `TemakiJob`, `TemakiResult`, `TobikoResult` |
+| Version | 2026.10.9 — date-based (`YEAR.MONTH.DAY`) since this release; 0.1.0–0.2.3 used semantic versioning |
+| `src/sushitruck/__init__.py` | Exists — `__version__ = "2026.10.9"`, exports all seven modules + `MakiClient`, `TemakiJob`, `TemakiResult`, `TobikoResult` |
 | `pyproject.toml` | Exists — hatchling build, Python ≥ 3.9, MIT license, optional extras declared |
 | `README.md` | Exists — install, usage examples, fleet context |
 | All planned modules | Implemented: `gari`, `wasabi`, `maki`, `sashimi`, `tobiko`, `temaki`, `nigiri` |
-| Tests | 129 passing tests, 96% line coverage (`pytest`); cloud and queue backends tested offline against in-memory stand-ins in `tests/conftest.py` |
+| Tests | 158 passing tests, 97% line coverage (`pytest`); cloud and queue backends tested offline against in-memory stand-ins in `tests/conftest.py` |
 | CI | `.github/workflows/tests.yml` — Python 3.9–3.13 on Linux, plus Windows and macOS; builds and checks distributions |
 | `LICENSE` | MIT |
 | Optional extras in `pyproject.toml` | Declared: `kafka`, `kinesis`, `cloud`, `websocket`, `all`, `dev` |
@@ -185,15 +185,16 @@ Named for nigiri — one clean piece at a time, precisely placed. `nigiri` conne
 | Source | Transport | Extra Required |
 |---|---|---|
 | Apache Kafka | `confluent-kafka` consumer | `[kafka]` |
-| AWS Kinesis | `boto3` shard reader | `[kinesis]` |
+| AWS Kinesis | `boto3` reader for every shard, following reshards | `[kinesis]` |
 | WebSocket | `websockets` async client | `[websocket]` |
-| HTTP webhook / SSE | stdlib `http.server` + `requests` | core |
+| HTTP webhook | stdlib `http.server` listener | core |
+| Server-sent events (SSE) | `requests` streaming client with automatic reconnect and `Last-Event-ID` resume | core |
 
 **Planned signature:**
 
 ```python
 def stream(
-    source: str,                          # "kafka", "kinesis", "websocket", "webhook"
+    source: str,                          # "kafka", "kinesis", "websocket", "webhook", "sse"
     *,
     config: dict,                         # source-specific connection config
     batch_size: int = 500,                # rows per yielded DataFrame
@@ -221,8 +222,15 @@ config = {
 config = {
     "stream_name":  "market-events",
     "region_name":  "us-east-1",
-    "shard_id":     "shardId-000000000000",
     "iterator_type": "TRIM_HORIZON",
+    # "shard_id": "shardId-000000000000",  # optional: only this shard; default reads all
+}
+
+# Server-sent events
+config = {
+    "url":     "https://stream.example.com/events",
+    "headers": {"Authorization": "Bearer <token>"},
+    "events":  ["update"],                  # optional event-type filter
 }
 
 # WebSocket
@@ -387,7 +395,7 @@ def read(
     format: str | None = None,       # "csv", "json", "jsonl", "parquet" — auto-detected from extension if None
     chunksize: int | None = None,     # None = load entire file; int = yield chunks of this row count
     schema: dict | None = None,       # optional wasabi schema for normalization per chunk
-    storage: str = "local",          # "local", "s3", "gcs"
+    storage: str | None = None,      # "local", "s3", "gcs" — inferred from s3:// / gs:// when None
     storage_options: dict | None = None,  # credentials / region for S3 or GCS
     **read_kwargs,                    # passed through to the underlying pandas reader
 ) -> pd.DataFrame | Generator[pd.DataFrame, None, None]
@@ -412,7 +420,7 @@ When `chunksize` is `None`, returns a single `pd.DataFrame`. When `chunksize` is
 | `"s3"` | `"s3://bucket/prefix/file.csv"` | `[cloud]` |
 | `"gcs"` | `"gs://bucket/prefix/file.csv"` | `[cloud]` |
 
-For S3 and GCS, path parsing, credential handling, and streaming download are handled transparently — the caller just passes a URI.
+For S3 and GCS, path parsing, credential handling, and streaming download are handled transparently — the caller just passes a URI. CSV and JSON Lines objects are streamed from the network as they are parsed; JSON and Parquet (which can't be parsed front-to-back) are copied to a temporary buffer that spills to disk beyond 64 MB.
 
 **`list_objects()` utility:**
 
@@ -467,7 +475,7 @@ paths = sashimi.list_objects(
 
 **Design notes:**
 
-- When `chunksize` is not set and the format supports it (CSV, JSONL), `sashimi` still reads in chunks internally to avoid a single massive `pd.read_csv()` call — it just concatenates them before returning
+- *(Dropped from the original plan, 0.3:)* reading in chunks internally when `chunksize` is not set. pandas already reads files efficiently, and the result has to fit in memory anyway, so it would add complexity for no gain. Use `chunksize` when memory matters.
 - `**read_kwargs` are forwarded to the underlying pandas reader, so `dtype=`, `usecols=`, `parse_dates=`, etc. all work as expected
 - Format auto-detection from extension covers 95% of use cases; explicit `format=` override handles the rest (e.g., a `.txt` file that is actually CSV)
 
@@ -480,7 +488,7 @@ paths = sashimi.list_objects(
 
 Named for wasabi — the sharp, clarifying hit that cuts through everything and makes structure apparent. `wasabi` is the normalization layer. It flattens nested JSON into a flat DataFrame, coerces types, renames columns, and enforces a schema — turning the messy raw payload into something ThaiTruck can work with.
 
-This is the module used internally by `maki.fetch()`, `nigiri.stream()`, and `sashimi.read()` when `schema=` is passed, and is also available as a standalone tool.
+This is the module used internally by `maki.fetch()`, `nigiri.stream()`, and `sashimi.read()` when `schema=` is passed, and is also available as a standalone tool. When a schema is applied to many DataFrames (stream batches, chunks, `TemakiJob` sources), the extra-columns warning is issued once per stream, read, or job rather than per batch.
 
 **Planned signatures:**
 
@@ -938,7 +946,7 @@ tobiko.send(merged, "s3://my-bucket/processed/merged.parquet",
 | Package | Status | Focus |
 |---|---|---|
 | **thaitruck** | Live on PyPI (v0.2.2) | Batch DataFrame cleaning, merging, profiling, caching |
-| **sushitruck** | Live on PyPI (v0.2.3) | Streaming ingestion, REST API connectors, file reading, normalization, output routing |
+| **sushitruck** | Live on PyPI (v2026.10.9) | Streaming ingestion, REST API connectors, file reading, normalization, output routing |
 | **ramentruck** | PyPI name secured (v0.1.0 stub) | ML/AI toolkit — training, tuning, cross-validation, explainability, deep learning |
 
 Each package is fully independent — none imports from another. They compose at the application layer through `pd.DataFrame`. SushiTruck produces them. ThaiTruck transforms them. RamenTruck models them. The user's code is the only thing that knows about all three.
@@ -977,8 +985,11 @@ twine upload dist/*      # publish to PyPI
 
 ### Version bump (two places)
 
-- `pyproject.toml` → `version = "x.y.z"`
-- `src/sushitruck/__init__.py` → `__version__ = "x.y.z"`
+Versions are the release date, `YEAR.MONTH.DAY` without leading zeros (`2026.10.9`); a second release on the same day adds a fourth number (`2026.10.9.1`).
+
+- `pyproject.toml` → `version = "YYYY.M.D"`
+- `src/sushitruck/__init__.py` → `__version__ = "YYYY.M.D"`
+- `CHANGELOG.md` → a `## [YYYY.M.D] - YYYY-MM-DD` heading, with any behavior change under *Breaking* or *Changed*
 
 ---
 

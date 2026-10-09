@@ -158,3 +158,43 @@ def test_stream_on_error_raise_propagates(tmp_path):
     job = temaki.TemakiJob().add_file(tmp_path / "missing.csv")
     with pytest.raises(Exception):
         list(job.stream())
+
+
+def test_add_glob_infers_s3_storage_from_pattern(fake_boto3):
+    fake_boto3.s3.objects[("bucket", "prices/a.csv")] = b"x\n1\n"
+    fake_boto3.s3.objects[("bucket", "prices/b.csv")] = b"x\n2\n"
+
+    result = temaki.TemakiJob().add_glob("s3://bucket/prices/*.csv").run()
+
+    assert sorted(result.df["x"].tolist()) == [1, 2]
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_run_warns_once_about_extra_columns(tmp_path, workers):
+    import warnings
+
+    for i in range(4):
+        (tmp_path / f"{i}.csv").write_text("x,extra\n1,a\n")
+
+    job = temaki.TemakiJob(workers=workers, schema={"x": {"dtype": int}}).add_glob(str(tmp_path / "*.csv"))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = job.run()
+
+    assert result.sources_processed == 4
+    assert len([w for w in caught if "not in schema" in str(w.message)]) == 1
+
+
+def test_stream_warns_once_about_extra_columns(tmp_path):
+    import warnings
+
+    for i in range(3):
+        (tmp_path / f"{i}.csv").write_text("x,extra\n1,a\n")
+
+    job = temaki.TemakiJob(schema={"x": {"dtype": int}}).add_glob(str(tmp_path / "*.csv"))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        batches = list(job.stream())
+
+    assert len(batches) == 3
+    assert len([w for w in caught if "not in schema" in str(w.message)]) == 1

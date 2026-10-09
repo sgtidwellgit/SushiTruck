@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import fnmatch
 import io
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any, Generator
 
@@ -20,6 +22,28 @@ _EXTENSION_FORMATS = {
 }
 
 _CHUNKABLE_FORMATS = {"csv", "jsonl"}
+
+# Formats pandas can parse front-to-back from a one-way stream. JSON and
+# Parquet need the whole object (Parquet's index is at the end of the file).
+_STREAMABLE_FORMATS = {"csv", "jsonl"}
+
+# Non-streamable cloud objects are buffered in memory up to this size, then
+# spill to a temporary file on disk.
+_SPOOL_MAX_BYTES = 64 * 1024 * 1024
+_COPY_BUFSIZE = 1024 * 1024
+
+_URI_STORAGE = {"s3://": "s3", "gs://": "gcs"}
+
+
+def _infer_storage(path: str, storage: str | None) -> str:
+    """Return ``storage`` if given, else infer it from the path's URI scheme."""
+
+    if storage is not None:
+        return storage
+    for scheme, backend in _URI_STORAGE.items():
+        if path.startswith(scheme):
+            return backend
+    return "local"
 
 
 def _detect_format(path: str, format: str | None) -> str:
@@ -42,11 +66,53 @@ def _split_uri(path: str) -> tuple[str, str]:
     return bucket, key
 
 
+class _ReadStream(io.RawIOBase):
+    """Adapt any object with ``read(n)`` (an S3 or GCS body) to a raw file object.
+
+    Wrapped in :class:`io.BufferedReader`, this gives pandas a standard binary
+    file that is read from the network a buffer at a time, instead of
+    downloading the whole object first.
+    """
+
+    def __init__(self, body: Any) -> None:
+        self._body = body
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        data = self._body.read(len(buffer))
+        n = len(data)
+        buffer[:n] = data
+        return n
+
+    def close(self) -> None:
+        if not self.closed:
+            close_body = getattr(self._body, "close", None)
+            if close_body is not None:
+                close_body()
+        super().close()
+
+
+def _as_readable(body: Any, fmt: str) -> Any:
+    """Return a file object for ``body``: streamed for CSV/JSONL, spooled otherwise."""
+
+    stream = io.BufferedReader(_ReadStream(body), buffer_size=_COPY_BUFSIZE)
+    if fmt in _STREAMABLE_FORMATS:
+        return stream
+
+    spool = tempfile.SpooledTemporaryFile(max_size=_SPOOL_MAX_BYTES)
+    with stream:
+        shutil.copyfileobj(stream, spool, _COPY_BUFSIZE)
+    spool.seek(0)
+    return spool
+
+
 def _open_local(path: str) -> Any:
     return open(path, "rb")
 
 
-def _open_s3(path: str, storage_options: dict[str, Any] | None) -> Any:
+def _open_s3(path: str, fmt: str, storage_options: dict[str, Any] | None) -> Any:
     try:
         import boto3
     except ImportError as e:
@@ -56,11 +122,10 @@ def _open_s3(path: str, storage_options: dict[str, Any] | None) -> Any:
 
     bucket, key = _split_uri(path)
     client = boto3.client("s3", **(storage_options or {}))
-    body = client.get_object(Bucket=bucket, Key=key)["Body"].read()
-    return io.BytesIO(body)
+    return _as_readable(client.get_object(Bucket=bucket, Key=key)["Body"], fmt)
 
 
-def _open_gcs(path: str, storage_options: dict[str, Any] | None) -> Any:
+def _open_gcs(path: str, fmt: str, storage_options: dict[str, Any] | None) -> Any:
     try:
         from google.cloud import storage as gcs_storage
     except ImportError as e:
@@ -72,16 +137,16 @@ def _open_gcs(path: str, storage_options: dict[str, Any] | None) -> Any:
     bucket_name, key = _split_uri(path)
     client = gcs_storage.Client(**(storage_options or {}))
     blob = client.bucket(bucket_name).blob(key)
-    return io.BytesIO(blob.download_as_bytes())
+    return _as_readable(blob.open("rb"), fmt)
 
 
-def _open_source(path: str, storage: str, storage_options: dict[str, Any] | None) -> Any:
+def _open_source(path: str, fmt: str, storage: str, storage_options: dict[str, Any] | None) -> Any:
     if storage == "local":
         return _open_local(path)
     if storage == "s3":
-        return _open_s3(path, storage_options)
+        return _open_s3(path, fmt, storage_options)
     if storage == "gcs":
-        return _open_gcs(path, storage_options)
+        return _open_gcs(path, fmt, storage_options)
     raise ValueError(f"Unsupported storage backend: {storage!r}")
 
 
@@ -112,7 +177,7 @@ def read(
     format: str | None = None,
     chunksize: int | None = None,
     schema: dict[str, dict] | None = None,
-    storage: str = "local",
+    storage: str | None = None,
     storage_options: dict[str, Any] | None = None,
     **read_kwargs: Any,
 ) -> pd.DataFrame | Generator[pd.DataFrame, None, None]:
@@ -134,8 +199,12 @@ def read(
     schema
         Optional :mod:`sushitruck.wasabi` schema applied to each returned
         chunk (or the single result) via :func:`sushitruck.wasabi.normalize`.
+        When reading in chunks, a warning about columns missing from the
+        schema is issued once per read, not once per chunk.
     storage
-        ``"local"``, ``"s3"``, or ``"gcs"``.
+        ``"local"``, ``"s3"``, or ``"gcs"``. Inferred from the path when
+        omitted: ``s3://`` means S3, ``gs://`` means GCS, anything else is a
+        local path.
     storage_options
         Backend-specific credentials/config (e.g. ``region_name`` for S3).
     **read_kwargs
@@ -147,10 +216,18 @@ def read(
     pd.DataFrame | Generator[pd.DataFrame, None, None]
         A single DataFrame, or a generator of DataFrames when ``chunksize``
         is set.
+
+    Notes
+    -----
+    CSV and JSON Lines objects in S3 or GCS are streamed: with ``chunksize``,
+    memory use stays roughly one chunk regardless of object size. JSON and
+    Parquet must be read whole, so those objects are first copied to a
+    temporary buffer that spills to disk beyond 64 MB.
     """
 
     path = str(path)
     fmt = _detect_format(path, format)
+    storage = _infer_storage(path, storage)
 
     if chunksize is not None:
         if fmt not in _CHUNKABLE_FORMATS:
@@ -160,7 +237,7 @@ def read(
             )
         return _read_chunked_and_normalize(path, fmt, chunksize, storage, storage_options, schema, read_kwargs)
 
-    with _open_source(path, storage, storage_options) as source:
+    with _open_source(path, fmt, storage, storage_options) as source:
         df = _read_full(source, fmt, **read_kwargs)
 
     if schema is not None:
@@ -180,13 +257,12 @@ def _read_chunked_and_normalize(
     schema: dict[str, dict] | None,
     read_kwargs: dict[str, Any],
 ) -> Generator[pd.DataFrame, None, None]:
-    with _open_source(path, storage, storage_options) as source:
-        for chunk in _read_chunked(source, fmt, chunksize, **read_kwargs):
-            if schema is not None:
-                from . import wasabi
+    from . import wasabi
 
-                chunk = wasabi.normalize(chunk, schema)
-            yield chunk
+    normalizer = wasabi._BatchNormalizer(schema) if schema is not None else None
+    with _open_source(path, fmt, storage, storage_options) as source:
+        for chunk in _read_chunked(source, fmt, chunksize, **read_kwargs):
+            yield normalizer(chunk) if normalizer is not None else chunk
 
 
 def _list_local(prefix: str, pattern: str | None) -> list[str]:
@@ -242,7 +318,7 @@ def _list_gcs(prefix: str, pattern: str | None, storage_options: dict[str, Any] 
 def list_objects(
     prefix: str,
     *,
-    storage: str = "local",
+    storage: str | None = None,
     storage_options: dict[str, Any] | None = None,
     pattern: str | None = None,
 ) -> list[str]:
@@ -254,7 +330,8 @@ def list_objects(
     prefix
         Local directory path, or ``s3://bucket/prefix`` / ``gs://bucket/prefix``.
     storage
-        ``"local"``, ``"s3"``, or ``"gcs"``.
+        ``"local"``, ``"s3"``, or ``"gcs"``. Inferred from the prefix when
+        omitted, as in :func:`read`.
     storage_options
         Backend-specific credentials/config.
     pattern
@@ -266,6 +343,7 @@ def list_objects(
         Matching paths or URIs, sorted.
     """
 
+    storage = _infer_storage(prefix, storage)
     if storage == "local":
         return _list_local(prefix, pattern)
     if storage == "s3":

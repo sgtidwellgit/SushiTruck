@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import warnings
 from typing import Any
 
@@ -146,15 +147,35 @@ def normalize(
         If ``strict=False`` and ``df`` has columns absent from ``schema``.
     """
 
-    extra_columns = set(df.columns) - set(schema)
+    result, extra_columns = _normalize(df, schema, strict=strict, coerce=coerce)
+    if extra_columns:
+        warnings.warn(_extra_columns_message(extra_columns), UserWarning, stacklevel=2)
+    return result
+
+
+_MAX_NAMED_COLUMNS = 10
+
+
+def _extra_columns_message(extra_columns: frozenset[str]) -> str:
+    names = sorted(extra_columns)
+    listed = ", ".join(repr(n) for n in names[:_MAX_NAMED_COLUMNS])
+    if len(names) > _MAX_NAMED_COLUMNS:
+        listed += f", and {len(names) - _MAX_NAMED_COLUMNS} more"
+    return f"Columns not in schema were kept unchanged: {listed}"
+
+
+def _normalize(
+    df: pd.DataFrame,
+    schema: dict[str, dict[str, Any]],
+    *,
+    strict: bool,
+    coerce: bool,
+) -> tuple[pd.DataFrame, frozenset[str]]:
+    """Apply ``schema`` and return the result plus the extra columns it kept."""
+
+    extra_columns = frozenset(set(df.columns) - set(schema))
     if strict and extra_columns:
         raise ValueError(f"Unexpected columns not in schema: {sorted(extra_columns)}")
-    if extra_columns:
-        warnings.warn(
-            f"Columns not in schema were kept unchanged: {sorted(extra_columns)}",
-            UserWarning,
-            stacklevel=2,
-        )
 
     missing_columns = set(schema) - set(df.columns)
     if missing_columns:
@@ -185,7 +206,39 @@ def normalize(
     if rename_map:
         result = result.rename(columns=rename_map)
 
-    return result
+    return result, extra_columns
+
+
+class _BatchNormalizer:
+    """Apply one schema to many DataFrames (stream batches, chunks, job sources).
+
+    Behaves like :func:`normalize` with ``strict=False``, except that the
+    extra-columns warning is issued at most once per instance — that is,
+    once per stream, chunked read, or job — however many DataFrames pass
+    through, and even when the extra columns vary between them (as they
+    often do in event feeds). Thread-safe, so a parallel job can share one
+    instance.
+    """
+
+    def __init__(self, schema: dict[str, dict[str, Any]]) -> None:
+        self.schema = schema
+        self._warned = False
+        self._lock = threading.Lock()
+
+    def __call__(self, df: pd.DataFrame) -> pd.DataFrame:
+        result, extra_columns = _normalize(df, self.schema, strict=False, coerce=True)
+        if extra_columns:
+            with self._lock:
+                first_time = not self._warned
+                self._warned = True
+            if first_time:
+                warnings.warn(
+                    _extra_columns_message(extra_columns)
+                    + " (shown once; later batches are not reported)",
+                    UserWarning,
+                    stacklevel=3,
+                )
+        return result
 
 
 def infer_schema(df: pd.DataFrame, *, sample_n: int | None = 1000) -> dict[str, dict[str, Any]]:

@@ -7,7 +7,7 @@
 
 **SushiTruck is a streaming ingestion and API connector toolkit for pandas — the conveyor belt of the data pipeline.**
 
-It handles everything that happens *before* analysis: calling REST APIs (with auth, pagination, rate limiting, and retry), reading large files from local disk, S3, or GCS in memory-safe chunks, consuming live streams from Kafka, Kinesis, WebSockets, or webhooks, flattening and type-checking messy JSON, and writing the cleaned result wherever it needs to go.
+It handles everything that happens *before* analysis: calling REST APIs (with auth, pagination, rate limiting, and retry), reading large files from local disk, S3, or GCS in memory-safe chunks, consuming live streams from Kafka, Kinesis, WebSockets, server-sent events, or webhooks, flattening and type-checking messy JSON, and writing the cleaned result wherever it needs to go.
 
 Every path ends in the same place: a clean `pandas.DataFrame`, or a generator of them.
 
@@ -24,7 +24,7 @@ pip install sushitruck
 - [Why SushiTruck?](#why-sushitruck)
 - [Installation](#installation)
 - [Quick start](#quick-start)
-- [Examples](#examples) — nine complete programs you can run right now
+- [Examples](#examples) — ten complete programs you can run right now
 - [The belt: module overview](#the-belt-module-overview)
 - [`maki` — REST API client](#maki--rest-api-client)
 - [`sashimi` — file and object store reader](#sashimi--file-and-object-store-reader)
@@ -81,7 +81,7 @@ Heavier integrations are optional extras. Install only what you use:
 
 | Extra | Adds | Installs |
 |---|---|---|
-| *(none)* | REST APIs, local files, webhook streams, local output | `pandas`, `numpy`, `requests` |
+| *(none)* | REST APIs, local files, webhook and server-sent event (SSE) streams, local output | `pandas`, `numpy`, `requests` |
 | `[cloud]` | Read from and write to **S3** and **GCS** | `boto3`, `google-cloud-storage` |
 | `[kafka]` | **Kafka** streaming (`nigiri`) and publishing (`tobiko`) | `confluent-kafka` |
 | `[kinesis]` | **AWS Kinesis** streaming and publishing | `boto3` |
@@ -135,7 +135,7 @@ print(f"wrote {result.rows_written} rows to {len(result.targets_written)} files"
 
 ## Examples
 
-Each example below is a **complete program**: copy it into a `.py` file and run it. They use only the core install, local files, and free public APIs that need no sign-up ([JSONPlaceholder](https://jsonplaceholder.typicode.com) and the [GitHub REST API](https://docs.github.com/en/rest)), so you can try every one right now. The output shown under each is what it actually printed.
+Each example below is a **complete program**: copy it into a `.py` file and run it. They use only the core install, local files, and free public APIs that need no sign-up ([JSONPlaceholder](https://jsonplaceholder.typicode.com), the [GitHub REST API](https://docs.github.com/en/rest), and [Wikimedia EventStreams](https://wikitech.wikimedia.org/wiki/Event_Platform/EventStreams_HTTP_Service)), so you can try every one right now. The output shown under each is what it actually printed.
 
 | # | Example | Shows |
 |---|---|---|
@@ -148,6 +148,7 @@ Each example below is a **complete program**: copy it into a `.py` file and run 
 | 7 | [Making any function resilient](#example-7--making-any-function-resilient) | `@retry`, `@rate_limit`, `@circuit_breaker` |
 | 8 | [Receiving a live stream of webhook events](#example-8--receiving-a-live-stream-of-webhook-events) | `nigiri.stream("webhook")` |
 | 9 | [A complete extract-normalize-load job](#example-9--a-complete-extract-normalize-load-job) | all of the above together |
+| 10 | [Watching Wikipedia edits live](#example-10--watching-wikipedia-edits-live) | `nigiri.stream("sse")` on a real public feed |
 
 For S3, GCS, Kafka, and Kinesis, which need your own accounts, see the templates under [Recipes](#recipes).
 
@@ -320,7 +321,7 @@ processed a chunk of 250,000 rows
 ['trades.csv']
 ```
 
-Only one 250,000-row chunk is in memory at a time, so the same loop works on a 50 GB file. Options such as `dtype=` pass straight through to `pandas.read_csv`. The same call reads from S3 or GCS by adding `storage="s3"` or `storage="gcs"` (with the `[cloud]` extra).
+Only one 250,000-row chunk is in memory at a time, so the same loop works on a 50 GB file. Options such as `dtype=` pass straight through to `pandas.read_csv`. Pass an `s3://` or `gs://` path instead (with the `[cloud]` extra) and the same loop streams the object from cloud storage, with memory still flat.
 
 ### Example 5 — Combining an API and a folder of files
 
@@ -512,7 +513,7 @@ batch of 3: users [3, 4, 5]
 batch of 1: users [6]
 ```
 
-The seventh event arrives alone. After `timeout_ms` with nothing else coming in, it is delivered as a batch of one rather than waiting forever. Swap `"webhook"` for `"websocket"`, `"kafka"`, or `"kinesis"` and change `config` (see [`nigiri`](#nigiri--streaming-source-adapters)); the loop stays the same.
+The seventh event arrives alone. After `timeout_ms` with nothing else coming in, it is delivered as a batch of one rather than waiting forever. Swap `"webhook"` for `"sse"`, `"websocket"`, `"kafka"`, or `"kinesis"` and change `config` (see [`nigiri`](#nigiri--streaming-source-adapters)); the loop stays the same.
 
 ### Example 9 — A complete extract-normalize-load job
 
@@ -555,6 +556,55 @@ user 3 has 20 todos, 7 completed
 
 This is the shape of most real ingestion jobs. To point it at your own systems, change the base URL and `auth=`, adjust the schema to your fields, and change the output path to `s3://...` or `gs://...`.
 
+
+### Example 10 — Watching Wikipedia edits live
+
+Wikimedia publishes every edit to every wiki as a public stream of [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events). This connects to it and summarizes the edits in batches.
+
+```python
+import json
+
+from sushitruck import nigiri
+
+
+# Each event is a large JSON document; keep just the fields we want.
+def pick_fields(data):
+    event = json.loads(data)
+    return {
+        "wiki": event["wiki"],
+        "title": event["title"],
+        "user": event["user"],
+        "bot": event["bot"],
+        "type": event["type"],
+    }
+
+
+# Every edit to every Wikimedia wiki, published live as server-sent events.
+config = {
+    "url": "https://stream.wikimedia.org/v2/stream/recentchange",
+    # Wikimedia asks clients to identify themselves.
+    "headers": {"User-Agent": "sushitruck-example/1.0 (https://github.com/sgtidwellgit/SushiTruck)"},
+}
+
+for batch in nigiri.stream("sse", config=config, deserializer=pick_fields,
+                           batch_size=200, timeout_ms=5000, max_batches=3,
+                           schema={"bot": {"dtype": bool}, "wiki": {"dtype": str},
+                                   "title": {"dtype": str}, "user": {"dtype": str},
+                                   "type": {"dtype": str}}):
+    print(f"{len(batch)} changes, {int(batch['bot'].sum())} by bots, "
+          f"busiest wiki: {batch['wiki'].value_counts().idxmax()}")
+```
+
+Output (live data, so yours will differ):
+
+```text
+161 changes, 53 by bots, busiest wiki: commonswiki
+192 changes, 116 by bots, busiest wiki: commonswiki
+100 changes, 66 by bots, busiest wiki: commonswiki
+```
+
+Each event is a large JSON document with dozens of fields. The `deserializer` keeps just the five this program uses, so the DataFrames stay small and the schema covers every column. If the connection drops, `nigiri` reconnects and sends the ID of the last event it received, so the server can resume where it left off. Remove `max_batches` to keep watching indefinitely.
+
 ---
 
 ## The belt: module overview
@@ -569,7 +619,7 @@ Every module is importable directly from the package: `from sushitruck import ma
 | [`gari`](#gari--rate-limiting-retry-and-circuit-breaking) | the palate cleanser between pieces | Rate limiting, retry with backoff, circuit breaker | `@rate_limit`, `@retry`, `@circuit_breaker` |
 | [`temaki`](#temaki--batch-ingestion-coordinator) | the hand roll you assemble yourself | Combine many files, globs, and API calls into one result | `TemakiJob` |
 | [`tobiko`](#tobiko--output-router) | the tiny roe scattered on top | Write DataFrames to local / S3 / GCS; publish rows to Kafka / Kinesis | `send()`, `publish()` |
-| [`nigiri`](#nigiri--streaming-source-adapters) | one clean piece at a time | Consume webhook, WebSocket, Kafka, or Kinesis streams as micro-batches | `stream()` |
+| [`nigiri`](#nigiri--streaming-source-adapters) | one clean piece at a time | Consume webhook, server-sent event (SSE), WebSocket, Kafka, or Kinesis streams as micro-batches | `stream()` |
 
 The package also exports the most-used classes at the top level:
 
@@ -761,7 +811,7 @@ for chunk in sashimi.read("prices.csv", chunksize=10_000, schema=schema):
 | `format` | auto | `"csv"`, `"json"`, `"jsonl"`, or `"parquet"`; detected from the extension if omitted |
 | `chunksize` | `None` | Rows per chunk. When set, `read()` returns a **generator** (CSV and JSON Lines only) |
 | `schema` | `None` | A [`wasabi` schema](#normalize--schema-enforcement) applied to the result or to every chunk |
-| `storage` | `"local"` | `"local"`, `"s3"`, or `"gcs"` |
+| `storage` | inferred | `"local"`, `"s3"`, or `"gcs"`. Inferred from the path when omitted: `s3://` is S3, `gs://` is GCS, anything else is local. Pass it explicitly only to override |
 | `storage_options` | `None` | Passed to the cloud client — e.g. `{"region_name": "us-east-1"}` for S3, `{"project": "my-project"}` for GCS |
 | `**read_kwargs` | | Forwarded to `pd.read_csv` / `pd.read_json` / `pd.read_parquet` |
 
@@ -778,26 +828,30 @@ For `.tsv` files, pass `sep="\t"`. Asking for `chunksize` on JSON or Parquet rai
 
 ### Reading from S3 and GCS
 
-Requires `pip install "sushitruck[cloud]"`. Set `storage=` explicitly to match the URI:
+Requires `pip install "sushitruck[cloud]"`. Pass an `s3://` or `gs://` path; the backend is picked from the path:
 
 ```python
 # S3 — credentials come from the normal boto3 chain (env vars, ~/.aws, instance role)
-df = sashimi.read(
-    "s3://my-bucket/data/prices.parquet",
-    storage="s3",
-    storage_options={"region_name": "us-east-1"},
-)
+df = sashimi.read("s3://my-bucket/data/prices.parquet",
+                  storage_options={"region_name": "us-east-1"})
 
-# S3, chunked
-for chunk in sashimi.read("s3://my-bucket/logs/events.jsonl", storage="s3", chunksize=10_000):
+# S3, chunked: streamed, so a 50 GB object needs no more memory than one chunk
+for chunk in sashimi.read("s3://my-bucket/logs/events.jsonl", chunksize=10_000):
     ...
 
 # GCS — credentials come from Application Default Credentials
-df = sashimi.read("gs://my-bucket/exports/users.csv", storage="gcs",
+df = sashimi.read("gs://my-bucket/exports/users.csv",
                   storage_options={"project": "my-project"})
 ```
 
-> Cloud objects are downloaded into memory before parsing. `chunksize` keeps the *DataFrames* small, but the raw object is held in memory while it's read. For very large objects, split them into several smaller objects and read them with [`temaki`](#temaki--batch-ingestion-coordinator).
+How much memory a cloud read uses depends on the format:
+
+| Format | How it's read from S3 / GCS | Memory |
+|---|---|---|
+| CSV, JSON Lines | **Streamed** from the network as pandas parses it | With `chunksize`: about one chunk, whatever the object size. Without it: just the resulting DataFrame |
+| JSON, Parquet | Copied to a temporary buffer first, since these formats can't be parsed front-to-back (Parquet's index is at the end of the file) | The buffer stays in memory up to 64 MB, then spills to a temporary file on disk |
+
+The network connection is closed when the read finishes, and also if you stop iterating a chunked read early.
 
 ### Listing objects
 
@@ -805,10 +859,10 @@ df = sashimi.read("gs://my-bucket/exports/users.csv", storage="gcs",
 sashimi.list_objects("data/", pattern="*.csv")
 # ['data/a.csv', 'data/b.csv']
 
-sashimi.list_objects("s3://my-bucket/prices/", storage="s3", pattern="*.parquet")
+sashimi.list_objects("s3://my-bucket/prices/", pattern="*.parquet")
 # ['s3://my-bucket/prices/2024-01.parquet', 's3://my-bucket/prices/2024-02.parquet', ...]
 
-sashimi.list_objects("gs://my-bucket/exports/", storage="gcs")
+sashimi.list_objects("gs://my-bucket/exports/")
 ```
 
 `pattern` is a glob matched against each object's file name. Results are always sorted, and S3 listings follow every page of results, so prefixes with more than 1,000 objects are listed completely.
@@ -865,6 +919,8 @@ For each column in the schema, in order: fill `default` → coerce to `dtype` �
 A schema column that's missing from the DataFrame always raises `ValueError`. The input DataFrame is never modified.
 
 > **Integers and nulls:** coercing a column with nulls to `int` fails, as it does in pandas. Give it a `"default"`, or use the nullable dtype `"Int64"`.
+
+When a schema is applied for you to many DataFrames — each batch of a `nigiri` stream, each chunk of a `sashimi` read, or each source in a `TemakiJob` — this warning is shown **once** for the whole stream, read, or job rather than once per batch. A warning names at most 10 columns, followed by "and N more".
 
 To silence the extra-columns warning for a known case, use the standard library:
 
@@ -994,7 +1050,7 @@ client = maki.MakiClient("https://api.example.com", auth={"type": "bearer", "tok
 
 job = (
     temaki.TemakiJob(workers=4, on_error="warn", schema={"price": {"dtype": float}})
-    .add_glob("s3://my-bucket/prices/*.parquet", storage="s3",
+    .add_glob("s3://my-bucket/prices/*.parquet",
               storage_options={"region_name": "us-east-1"})
     .add_api(client, "/supplemental", paginate=True, pagination="cursor", results_key="data")
     .add_file("local_overrides.csv")
@@ -1021,8 +1077,8 @@ Every `add_*` method returns the job, so calls chain.
 
 | Method | Adds |
 |---|---|
-| `add_file(path, *, format=None, chunksize=None, storage="local", storage_options=None, **read_kwargs)` | One file, read with [`sashimi.read`](#reading-files) |
-| `add_glob(pattern, *, storage="local", storage_options=None, **read_kwargs)` | Every file matching a pattern such as `data/*.csv` or `s3://bucket/prefix/*.parquet`. The pattern is resolved when `add_glob` is called |
+| `add_file(path, *, format=None, chunksize=None, storage=None, storage_options=None, **read_kwargs)` | One file, read with [`sashimi.read`](#reading-files) |
+| `add_glob(pattern, *, storage=None, storage_options=None, **read_kwargs)` | Every file matching a pattern such as `data/*.csv` or `s3://bucket/prefix/*.parquet` (storage is inferred from the pattern). The pattern is resolved when `add_glob` is called |
 | `add_api(client, endpoint, *, params=None, paginate=False, results_key=None, **fetch_kwargs)` | One endpoint, read with [`MakiClient.fetch`](#get-post-and-fetch). `fetch_kwargs` passes pagination options such as `pagination="offset"` or `page_size=500` |
 
 ### Running
@@ -1111,12 +1167,12 @@ for batch in nigiri.stream("kafka", config=kafka_config, batch_size=1_000, timeo
 
 | Parameter | Default | Description |
 |---|---|---|
-| `source` | *(required)* | `"webhook"`, `"websocket"`, `"kafka"`, or `"kinesis"` |
+| `source` | *(required)* | `"webhook"`, `"sse"`, `"websocket"`, `"kafka"`, or `"kinesis"` |
 | `config` | *(required)* | Source-specific settings — see below |
 | `batch_size` | `500` | Maximum rows per DataFrame |
 | `timeout_ms` | `1000` | Maximum wait for a full batch. When it expires, whatever has arrived is yielded as a partial batch, so a quiet stream never stalls your loop |
-| `schema` | `None` | Each batch is run through `wasabi.flatten` and then `wasabi.normalize` with this schema |
-| `deserializer` | `json.loads` | Turns one raw message (bytes or str) into a record dict. Use it for Avro, Protobuf, MessagePack, CSV lines, ... |
+| `schema` | `None` | Each batch is run through `wasabi.flatten` and then `wasabi.normalize` with this schema. A warning about columns missing from the schema is shown once per stream, not per batch |
+| `deserializer` | `json.loads` | Turns one raw message (bytes or str; for SSE, the event's `data` text) into a record dict. Use it for Avro, Protobuf, MessagePack, CSV lines, or to keep only some fields |
 | `max_batches` | `None` | Stop after this many batches. `None` runs until you break out, or until the source closes |
 
 Closing the generator — calling `.close()`, or breaking out of a `for` loop that owns it — shuts down the underlying server, connection, or consumer.
@@ -1126,9 +1182,10 @@ Closing the generator — calling `.close()`, or breaking out of a `for` loop th
 | Source | Extra | `config` keys |
 |---|---|---|
 | `"webhook"` | *(core)* | `host` (default `"0.0.0.0"`), `port` (default `8080`), `path` (default `"/ingest"`) |
+| `"sse"` | *(core)* | `url` (required), `headers`, `params`, `events` (event types to keep; default all), `reconnect` (default `True`), `retry_ms` (default `3000`), `max_retries` (default unlimited), `read_timeout` (seconds, default `60`) |
 | `"websocket"` | `[websocket]` | `uri` (required), `headers` (optional dict) |
 | `"kafka"` | `[kafka]` | `topic` (required), plus any `confluent_kafka.Consumer` setting such as `bootstrap.servers`, `group.id`, `auto.offset.reset` |
-| `"kinesis"` | `[kinesis]` | `stream_name`, `shard_id` (required), `region_name`, `iterator_type` (default `"TRIM_HORIZON"`) |
+| `"kinesis"` | `[kinesis]` | `stream_name` (required), `region_name`, `iterator_type` (default `"TRIM_HORIZON"`), `shard_id` (optional: read only that shard) |
 
 **Webhook** — starts a small HTTP server and turns every `POST` to `path` into one record. `POST`s to other paths get a `404`.
 
@@ -1138,6 +1195,23 @@ for batch in nigiri.stream("webhook", config={"host": "127.0.0.1", "port": 8080,
 ```
 
 > The webhook listener is a plain HTTP server with no TLS and no authentication. Bind it to `127.0.0.1` or a private network, and put a reverse proxy in front of it if it must face the internet.
+
+**Server-sent events (SSE)** — connects to an HTTP endpoint that streams `text/event-stream` (the format browsers use with `EventSource`) and turns each event's `data` into one record. Many live feeds and notification APIs use it.
+
+```python
+config = {
+    "url": "https://api.example.com/v1/events",
+    "headers": {"Authorization": "Bearer <token>"},
+    "events": ["order.created", "order.updated"],   # optional: keep only these event types
+}
+for batch in nigiri.stream("sse", config=config, batch_size=500, timeout_ms=2_000):
+    ...
+```
+
+- Parsing follows the SSE standard: multi-line `data:`, comment and keep-alive lines, `event:` types (events without one are `"message"`), `id:`, and every line-ending style.
+- **Reconnects automatically.** If the connection drops, goes silent for `read_timeout` seconds, or the server returns a 5xx, 408, or 429, `nigiri` waits `retry_ms` (or the server's `retry:` value) and reconnects. It sends `Last-Event-ID` so the server can resume after the last event received. Set `max_retries` to give up with a `ConnectionError` after that many consecutive failures, or `reconnect=False` to end the stream when the server closes it.
+- **Fails fast on caller errors.** Any other 4xx response, such as `401 Unauthorized`, is raised as `requests.HTTPError` instead of retried. An HTTP `204` means the server wants the client to stop, so the stream ends normally.
+- Events are delivered as they arrive, whether or not the server uses chunked transfer encoding.
 
 **WebSocket** — connects to `uri` and treats each text or binary message as one record.
 
@@ -1160,18 +1234,23 @@ for batch in nigiri.stream("kafka", config=config, batch_size=1_000):
     ...
 ```
 
-**Kinesis** — reads one shard from the chosen iterator position. The stream ends when the shard is closed and fully read.
+**Kinesis** — reads **every shard** of the stream, starting from `iterator_type` (`"TRIM_HORIZON"` for the oldest record still retained, or `"LATEST"` for new records only).
 
 ```python
 config = {
     "stream_name": "market-events",
-    "shard_id": "shardId-000000000000",
     "region_name": "us-east-1",
     "iterator_type": "LATEST",
 }
 for batch in nigiri.stream("kinesis", config=config, max_batches=100):
     ...
 ```
+
+- Shards are listed when the stream starts and read in turn, so one busy shard can't starve the others, and a quiet shard doesn't hold up batches.
+- **Resharding is followed.** When a shard is split or merged while you read, it closes, and its child shards are picked up and read from their beginning, so no records are missed.
+- The stream ends when every shard is closed and fully read. On a live stream that never happens, so use `max_batches` or break out of the loop.
+- Records are in order *within* a shard (that is, per partition key), but batches mix records from different shards.
+- To read just one shard (for example, to spread shards across several processes yourself), add `"shard_id": "shardId-000000000000"`. Child shards are then not followed.
 
 ---
 
@@ -1288,9 +1367,11 @@ def geocode(address):
 | `requests.HTTPError` | Non-retryable status, or retries ran out | Check `exc.response.status_code` and the API's docs |
 | `ValueError: Column 'x' is non-nullable but contains null values.` | A schema column marked `nullable: False` has nulls | Add a `"default"`, or relax `nullable` |
 | `ValueError: Schema columns missing from DataFrame` | The schema names a column the data doesn't have | Check spelling, or check that `flatten` produced the name you expect |
-| `UserWarning: Columns not in schema were kept unchanged` | `normalize(strict=False)` found extra columns | Add them to the schema, select them away, use `strict=True`, or filter the warning |
+| `UserWarning: Columns not in schema were kept unchanged` | `normalize(strict=False)` found extra columns (shown once per stream, read, or job) | Add them to the schema, select them away (for streams, a `deserializer` that keeps only the fields you want), use `strict=True`, or filter the warning |
 | `gari.CircuitBreakerOpenError` | Too many consecutive failures | Wait `recovery_timeout`, or handle it with a fallback |
-| `s3://...` path treated as a local file | `storage` defaults to `"local"` | Pass `storage="s3"` (or `"gcs"`) |
+| `s3://...` path read as a local file | `storage="local"` was passed explicitly, which overrides the path | Leave `storage` out; it's inferred from `s3://` / `gs://` |
+| `requests.HTTPError: 401 ...` from an SSE stream | The server rejected the request (bad or missing credentials) | Check the `headers` in `config`. Client errors are raised immediately, not retried |
+| `ConnectionError: SSE stream ... failed N times in a row` | The SSE server stayed unreachable for `max_retries` attempts | Check the URL and network, or raise `max_retries` |
 
 ---
 
@@ -1355,7 +1436,7 @@ python -m twine check --strict dist/*
 python -m twine upload dist/*
 ```
 
-When bumping the version, update it in **both** `pyproject.toml` and `src/sushitruck/__init__.py`.
+Versions are release dates (see [Changelog and versioning](#changelog-and-versioning)). When releasing, set the date in **both** `pyproject.toml` and `src/sushitruck/__init__.py`, written without leading zeros (`2026.10.9`).
 
 The full design document — each module's original specification, design notes, and roadmap — is in [`PROJECT.md`](https://github.com/sgtidwellgit/SushiTruck/blob/main/PROJECT.md).
 
@@ -1363,7 +1444,11 @@ The full design document — each module's original specification, design notes,
 
 ## Changelog and versioning
 
-SushiTruck follows [semantic versioning](https://semver.org/). While the major version is 0, minor releases may include small API changes, which are always listed in the changelog.
+SushiTruck uses **date-based versions**: each version is the date it was released, as `YEAR.MONTH.DAY` — for example, `2026.10.9` was released on 9 October 2026. A second release on the same day adds a fourth number (`2026.10.9.1`). Python's packaging tools drop leading zeros, so October 9 is `2026.10.9`, not `2026.10.09`.
+
+Releases up to `0.2.3` used semantic versioning. Date versions sort after them, so `pip install --upgrade sushitruck` moves from `0.2.3` to the date-based releases normally.
+
+A date doesn't say whether anything broke, so **every behavior change is listed in the changelog** under *Breaking* or *Changed*. Read it before upgrading across releases, and pin an exact version (`sushitruck==2026.10.9`) where you need full control.
 
 See [`CHANGELOG.md`](https://github.com/sgtidwellgit/SushiTruck/blob/main/CHANGELOG.md) for release notes.
 

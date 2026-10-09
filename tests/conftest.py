@@ -17,15 +17,46 @@ from typing import Any
 import pytest
 
 
+class StreamingBody:
+    """A network-style response body: ``read(n)`` and ``close()`` only.
+
+    No seeking and no line iteration, like a real S3 ``StreamingBody`` or a
+    GCS blob reader, so a code path that needs the whole object up front
+    fails here instead of passing by accident. ``bytes_read`` and
+    ``max_read`` record how the body was consumed.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self._buf = io.BytesIO(data)
+        self.size = len(data)
+        self.bytes_read = 0
+        self.max_read = 0
+        self.closed = False
+
+    def read(self, amt: int | None = None) -> bytes:
+        if amt is None or amt < 0:
+            amt = self.size
+        chunk = self._buf.read(amt)
+        self.bytes_read += len(chunk)
+        self.max_read = max(self.max_read, len(chunk))
+        return chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakeS3:
     """Just enough of a boto3 S3 client: get/put objects and paginated listing."""
 
     def __init__(self) -> None:
         self.objects: dict[tuple[str, str], bytes] = {}
         self.client_kwargs: list[dict[str, Any]] = []
+        self.bodies: list[StreamingBody] = []
 
     def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803
-        return {"Body": io.BytesIO(self.objects[(Bucket, Key)])}
+        body = StreamingBody(self.objects[(Bucket, Key)])
+        self.bodies.append(body)
+        return {"Body": body}
 
     def put_object(self, *, Bucket: str, Key: str, Body: bytes) -> dict[str, Any]:  # noqa: N803
         self.objects[(Bucket, Key)] = Body
@@ -45,25 +76,69 @@ class FakeS3:
 
 
 class FakeKinesis:
-    """Just enough of a boto3 Kinesis client: one shard, read and write."""
+    """Just enough of a boto3 Kinesis client: several shards, resharding, read and write.
+
+    ``shards`` maps shard id to its records. A shard listed in ``closed`` ends
+    once fully read (no next iterator); any other shard stays open and
+    returns empty reads when caught up. ``children`` maps a parent shard to
+    child shards that are reported (via ``ChildShards``) when the parent
+    closes, but are not returned by ``list_shards``, as after a reshard that
+    happens mid-read.
+    """
 
     def __init__(self) -> None:
-        self.records: list[bytes] = []
+        self.shards: dict[str, list[bytes]] = {}
+        self.closed: set[str] = set()
+        self.children: dict[str, list[str]] = {}
+        self.listed: list[str] | None = None
         self.put_calls: list[dict[str, Any]] = []
         self.client_kwargs: list[dict[str, Any]] = []
+        self.iterator_requests: list[dict[str, Any]] = []
+        self.list_calls: list[dict[str, Any]] = []
+
+    @property
+    def records(self) -> list[bytes]:
+        return self.shards.get("shardId-0", [])
+
+    @records.setter
+    def records(self, value: list[bytes]) -> None:
+        # The single-shard form used by most tests: one closed shard.
+        self.shards = {"shardId-0": value}
+        self.closed = {"shardId-0"}
+
+    def list_shards(self, **kwargs: Any) -> dict[str, Any]:
+        self.list_calls.append(kwargs)
+        if "NextToken" in kwargs and "StreamName" in kwargs:
+            # The real API rejects this combination.
+            raise ValueError("StreamName and NextToken cannot be combined")
+        ids = self.listed if self.listed is not None else sorted(self.shards)
+        start = int(kwargs.get("NextToken", 0))
+        # One shard per page, so callers must follow NextToken.
+        page = {"Shards": [{"ShardId": shard_id} for shard_id in ids[start : start + 1]]}
+        if start + 1 < len(ids):
+            page["NextToken"] = str(start + 1)
+        return page
 
     def get_shard_iterator(self, **kwargs: Any) -> dict[str, Any]:
-        return {"ShardIterator": "0"}
+        self.iterator_requests.append(kwargs)
+        return {"ShardIterator": f"{kwargs['ShardId']}:0"}
 
     def get_records(self, *, ShardIterator: str, Limit: int) -> dict[str, Any]:  # noqa: N803
-        start = int(ShardIterator)
-        chunk = self.records[start : start + Limit]
+        shard_id, _, position = ShardIterator.rpartition(":")
+        start = int(position)
+        records = self.shards[shard_id]
+        chunk = records[start : start + Limit]
         end = start + len(chunk)
-        return {
-            "Records": [{"Data": data} for data in chunk],
+
+        response: dict[str, Any] = {"Records": [{"Data": data} for data in chunk]}
+        if shard_id in self.closed and end >= len(records):
             # A closed shard returns no next iterator once fully read.
-            "NextShardIterator": str(end) if end < len(self.records) else None,
-        }
+            response["NextShardIterator"] = None
+            if shard_id in self.children:
+                response["ChildShards"] = [{"ShardId": c} for c in self.children[shard_id]]
+        else:
+            response["NextShardIterator"] = f"{shard_id}:{end}"
+        return response
 
     def put_record(self, *, StreamName: str, Data: bytes, PartitionKey: str) -> dict[str, Any]:  # noqa: N803
         self.put_calls.append({"StreamName": StreamName, "Data": Data, "PartitionKey": PartitionKey})
@@ -100,6 +175,12 @@ class _FakeBlob:
     def download_as_bytes(self) -> bytes:
         return self._store[(self._bucket, self.name)]
 
+    def open(self, mode: str = "r") -> StreamingBody:
+        assert mode == "rb"
+        body = StreamingBody(self._store[(self._bucket, self.name)])
+        FakeGCSClient.opened.append(body)
+        return body
+
     def upload_from_string(self, payload: bytes) -> None:
         self._store[(self._bucket, self.name)] = payload
 
@@ -116,6 +197,7 @@ class _FakeBucket:
 class FakeGCSClient:
     store: dict[tuple[str, str], bytes] = {}
     init_kwargs: list[dict[str, Any]] = []
+    opened: list[StreamingBody] = []
 
     def __init__(self, **kwargs: Any) -> None:
         type(self).init_kwargs.append(kwargs)
@@ -136,6 +218,8 @@ def fake_gcs(monkeypatch):
     """Install a fake ``google.cloud.storage`` backed by an in-memory dict."""
 
     client_cls = type("Client", (FakeGCSClient,), {"store": {}, "init_kwargs": []})
+    FakeGCSClient.opened = []
+    client_cls.opened = FakeGCSClient.opened
 
     storage = types.ModuleType("google.cloud.storage")
     storage.Client = client_cls  # type: ignore[attr-defined]

@@ -74,7 +74,7 @@ class TemakiJob:
         *,
         format: str | None = None,
         chunksize: int | None = None,
-        storage: str = "local",
+        storage: str | None = None,
         storage_options: dict[str, Any] | None = None,
         **read_kwargs: Any,
     ) -> "TemakiJob":
@@ -126,7 +126,7 @@ class TemakiJob:
         self,
         pattern: str,
         *,
-        storage: str = "local",
+        storage: str | None = None,
         storage_options: dict[str, Any] | None = None,
         **read_kwargs: Any,
     ) -> "TemakiJob":
@@ -142,13 +142,15 @@ class TemakiJob:
 
         return self
 
-    def _apply_schema(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _new_normalizer(self) -> Callable[[pd.DataFrame], pd.DataFrame]:
+        """One schema applier per run/stream, so a warning prints once per job."""
+
         if self._schema is None:
-            return df
+            return lambda df: df
 
         from . import wasabi
 
-        return wasabi.normalize(df, self._schema)
+        return wasabi._BatchNormalizer(self._schema)
 
     @staticmethod
     def _materialize(result: Any) -> pd.DataFrame:
@@ -157,8 +159,10 @@ class TemakiJob:
         chunks = list(result)
         return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
-    def _process(self, source: dict[str, Any]) -> pd.DataFrame:
-        return self._apply_schema(self._materialize(source["reader"]()))
+    def _process(
+        self, source: dict[str, Any], normalize: Callable[[pd.DataFrame], pd.DataFrame]
+    ) -> pd.DataFrame:
+        return normalize(self._materialize(source["reader"]()))
 
     def run(self) -> TemakiResult:
         """
@@ -174,6 +178,7 @@ class TemakiJob:
         """
 
         start = time.perf_counter()
+        normalize = self._new_normalizer()
         frames: list[pd.DataFrame] = []
         failed: list[dict[str, str]] = []
         processed = 0
@@ -181,14 +186,14 @@ class TemakiJob:
         if self.workers <= 1:
             for source in self._sources:
                 try:
-                    frames.append(self._process(source))
+                    frames.append(self._process(source, normalize))
                     processed += 1
                 except Exception as exc:
                     self._handle_failure(source, exc, failed)
         else:
             with ThreadPoolExecutor(max_workers=self.workers) as executor:
                 future_to_source = {
-                    executor.submit(self._process, source): source for source in self._sources
+                    executor.submit(self._process, source, normalize): source for source in self._sources
                 }
                 for future in as_completed(future_to_source):
                     source = future_to_source[future]
@@ -231,14 +236,15 @@ class TemakiJob:
         chunk; all other sources yield a single DataFrame.
         """
 
+        normalize = self._new_normalizer()
         for source in self._sources:
             try:
                 result = source["reader"]()
                 if isinstance(result, pd.DataFrame):
-                    yield self._apply_schema(result)
+                    yield normalize(result)
                 else:
                     for chunk in result:
-                        yield self._apply_schema(chunk)
+                        yield normalize(chunk)
             except Exception as exc:
                 if self.on_error == "raise":
                     raise

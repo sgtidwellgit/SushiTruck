@@ -1,6 +1,27 @@
 # Changelog
 
-All notable changes to SushiTruck are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [semantic versioning](https://semver.org/).
+All notable changes to SushiTruck are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), Versions up to 0.2.3 used semantic versioning; from 2026.10.9 on, versions are the release date (`YEAR.MONTH.DAY`, with a fourth number for a second release on the same day). Breaking changes are always listed under **Breaking** or **Changed**.
+
+## [2026.10.9] - 2026-10-09
+
+First date-versioned release. It installs as an upgrade from 0.2.3: pip orders `2026.10.9` after every `0.x` version.
+
+### Added
+
+- `nigiri.stream("sse")` — a server-sent events source, needing nothing beyond the core install. It parses the SSE standard (multi-line data, comments, event types, ids, every line-ending style) and delivers events as they arrive. On a dropped, silent, or 5xx/408/429 connection it reconnects automatically, honoring the server's `retry:` delay and sending `Last-Event-ID` so the server can resume. Other 4xx errors are raised instead of retried; HTTP 204 ends the stream. Options: `events`, `reconnect`, `retry_ms`, `max_retries`, `read_timeout`, `headers`, `params`.
+- `nigiri.stream("kinesis")` reads **every shard** when `shard_id` is omitted (paginating the shard list), rotating between shards so none starves the others, and follows child shards after a reshard so no records are missed. Passing `shard_id` keeps the previous single-shard behavior.
+- `sashimi.read()`, `sashimi.list_objects()`, and `TemakiJob.add_file()` / `add_glob()` infer `storage` from the path: `s3://` is S3, `gs://` is GCS, anything else is local. An explicit `storage=` still takes precedence.
+- README: Example 10 (live Wikipedia edits over SSE), and reference sections for SSE, multi-shard Kinesis, and streaming cloud reads.
+
+### Changed
+
+- **S3 and GCS reads now stream.** CSV and JSON Lines objects are parsed directly from the network, so a chunked read of a very large object uses about one chunk of memory instead of downloading the whole object first. JSON and Parquet objects are copied to a temporary buffer that spills to disk beyond 64 MB, instead of being held entirely in memory. Connections are closed when a read finishes or is abandoned. GCS objects are read with `blob.open("rb")`.
+- When a schema is applied to many DataFrames — `nigiri` stream batches, chunked `sashimi` reads, and `TemakiJob` sources — the "columns not in schema" warning is shown **once** per stream, read, or job, instead of once per batch. Direct `wasabi.normalize()` calls still warn every time.
+- The "columns not in schema" warning names at most 10 columns, followed by "and N more".
+
+### Removed
+
+- The design document no longer promises internal chunked reading when `chunksize` isn't set; it brought no benefit (see `PROJECT.md`).
 
 ## [0.2.3] - 2026-10-09
 

@@ -5,7 +5,7 @@ from sushitruck.maki import MakiClient
 from sushitruck.results import TemakiResult, TobikoResult
 from sushitruck.temaki import TemakiJob
 
-__version__ = "0.2.3"
+__version__ = "2026.10.9"
 
 __all__ = [
     "gari",

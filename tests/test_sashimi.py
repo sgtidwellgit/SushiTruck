@@ -193,3 +193,115 @@ def test_read_closes_local_file(csv_file):
         warnings.simplefilter("error", ResourceWarning)
         sashimi.read(csv_file)
         list(sashimi.read(csv_file, chunksize=1))
+
+
+# --- streaming cloud reads ---
+
+
+def _big_csv(rows=100_000):
+    return b"id,symbol\n" + b"".join(b"%d,SYM%d\n" % (i, i % 7) for i in range(rows))
+
+
+def test_s3_chunked_read_streams_instead_of_downloading_whole_object(fake_boto3):
+    fake_boto3.s3.objects[("bucket", "big.csv")] = _big_csv()
+
+    chunks = sashimi.read("s3://bucket/big.csv", storage="s3", chunksize=1_000)
+    first = next(chunks)
+    body = fake_boto3.s3.bodies[0]
+
+    assert len(first) == 1_000
+    # Only a small part of the object was read to produce the first chunk.
+    assert body.bytes_read < body.size / 2
+    assert body.max_read <= 1024 * 1024
+
+    total = len(first) + sum(len(c) for c in chunks)
+    assert total == 100_000
+    assert body.closed
+
+
+def test_gcs_chunked_read_streams_instead_of_downloading_whole_object(fake_gcs):
+    fake_gcs.store[("bucket", "big.jsonl")] = b"".join(b'{"i": %d}\n' % i for i in range(100_000))
+
+    chunks = sashimi.read("gs://bucket/big.jsonl", storage="gcs", chunksize=1_000)
+    first = next(chunks)
+    body = fake_gcs.opened[0]
+
+    assert len(first) == 1_000
+    assert body.bytes_read < body.size / 2
+    assert len(first) + sum(len(c) for c in chunks) == 100_000
+    assert body.closed
+
+
+def test_abandoning_a_chunked_cloud_read_closes_the_connection(fake_boto3):
+    fake_boto3.s3.objects[("bucket", "big.csv")] = _big_csv()
+
+    chunks = sashimi.read("s3://bucket/big.csv", storage="s3", chunksize=1_000)
+    next(chunks)
+    chunks.close()
+
+    assert fake_boto3.s3.bodies[0].closed
+
+
+def test_whole_cloud_reads_close_the_connection(fake_boto3):
+    import io
+
+    buf = io.BytesIO()
+    pd.DataFrame({"a": [1, 2]}).to_parquet(buf)
+    fake_boto3.s3.objects[("bucket", "t.parquet")] = buf.getvalue()
+    fake_boto3.s3.objects[("bucket", "t.csv")] = b"a\n1\n2\n"
+
+    assert sashimi.read("s3://bucket/t.parquet", storage="s3")["a"].tolist() == [1, 2]
+    assert sashimi.read("s3://bucket/t.csv", storage="s3")["a"].tolist() == [1, 2]
+    assert all(body.closed for body in fake_boto3.s3.bodies)
+
+
+def test_large_parquet_spools_to_disk(fake_boto3, monkeypatch):
+    import io
+
+    monkeypatch.setattr(sashimi, "_SPOOL_MAX_BYTES", 1024)
+    buf = io.BytesIO()
+    pd.DataFrame({"a": range(10_000)}).to_parquet(buf)
+    fake_boto3.s3.objects[("bucket", "big.parquet")] = buf.getvalue()
+
+    df = sashimi.read("s3://bucket/big.parquet", storage="s3")
+    assert len(df) == 10_000
+
+
+# --- storage inferred from the path ---
+
+
+def test_read_infers_storage_from_uri(fake_boto3, fake_gcs):
+    fake_boto3.s3.objects[("bucket", "a.csv")] = b"x\n1\n"
+    fake_gcs.store[("bucket", "b.csv")] = b"x\n2\n"
+
+    assert sashimi.read("s3://bucket/a.csv")["x"].tolist() == [1]
+    assert sashimi.read("gs://bucket/b.csv")["x"].tolist() == [2]
+
+
+def test_list_objects_infers_storage_from_uri(fake_boto3, fake_gcs):
+    fake_boto3.s3.objects[("bucket", "p/a.csv")] = b"x"
+    fake_gcs.store[("bucket", "p/b.csv")] = b"x"
+
+    assert sashimi.list_objects("s3://bucket/p/") == ["s3://bucket/p/a.csv"]
+    assert sashimi.list_objects("gs://bucket/p/") == ["gs://bucket/p/b.csv"]
+
+
+def test_explicit_storage_overrides_inference(fake_boto3):
+    fake_boto3.s3.objects[("bucket", "a.csv")] = b"x\n1\n"
+
+    with pytest.raises(OSError):
+        sashimi.read("s3://bucket/a.csv", storage="local")
+
+
+# --- schema warnings: once per read, not once per chunk ---
+
+
+def test_chunked_read_warns_once_about_extra_columns(csv_file):
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        chunks = list(sashimi.read(csv_file, chunksize=1, schema={"price": {"dtype": float}}))
+
+    assert len(chunks) == 3
+    assert len([w for w in caught if "not in schema" in str(w.message)]) == 1
