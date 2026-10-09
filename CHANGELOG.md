@@ -2,6 +2,16 @@
 
 All notable changes to SushiTruck are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- The `[dev]` extra now installs `pyarrow`, so the Parquet tests pass in a fresh development environment (and in CI).
+
+### Changed
+
+- CI uses `actions/checkout@v5` and `actions/setup-python@v6`.
+
 ## [0.2.2] - 2026-10-09
 
 ### Added
