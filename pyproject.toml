@@ -4,13 +4,27 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sushitruck"
-version = "0.2.1"
+version = "0.2.2"
 description = "A streaming ingestion and API connector toolkit — the conveyor belt of the data pipeline."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "sgtidwell" }]
-keywords = ["data-ingestion", "etl", "api-client", "streaming", "pandas"]
+authors = [{ name = "Babble Baz", email = "dev@babblebaz.com" }]
+keywords = [
+    "data-ingestion",
+    "etl",
+    "api-client",
+    "rest",
+    "pagination",
+    "streaming",
+    "kafka",
+    "kinesis",
+    "websocket",
+    "s3",
+    "gcs",
+    "pandas",
+    "dataframe",
+]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -20,6 +34,8 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
     "Topic :: Software Development :: Libraries",
     "Topic :: Scientific/Engineering :: Information Analysis",
     "Typing :: Typed",
@@ -35,11 +51,14 @@ dev = ["pytest>=7", "pytest-cov", "responses>=0.23", "build", "twine"]
 kafka = ["confluent-kafka>=2.0"]
 kinesis = ["boto3>=1.26"]
 cloud = ["boto3>=1.26", "google-cloud-storage>=2.0"]
-websocket = ["websockets>=11.0"]
+websocket = ["websockets>=14.0"]
 all = ["sushitruck[kafka,kinesis,cloud,websocket]"]
 
 [project.urls]
 Homepage = "https://github.com/sgtidwellgit/SushiTruck"
+Repository = "https://github.com/sgtidwellgit/SushiTruck"
+Issues = "https://github.com/sgtidwellgit/SushiTruck/issues"
+Changelog = "https://github.com/sgtidwellgit/SushiTruck/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -48,6 +67,7 @@ include = [
     "README.md",
     "CHANGELOG.md",
     "PROJECT.md",
+    "LICENSE",
     "pyproject.toml",
 ]
 

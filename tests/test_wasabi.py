@@ -108,3 +108,22 @@ def test_infer_schema_detects_nullable():
     df = pd.DataFrame({"price": [1.0, None]})
     schema = wasabi.infer_schema(df)
     assert schema["price"]["nullable"] is True
+
+
+def test_normalize_warns_on_extra_columns_when_not_strict():
+    df = pd.DataFrame({"price": ["1.5"], "extra": [1]})
+
+    with pytest.warns(UserWarning, match="extra"):
+        result = wasabi.normalize(df, {"price": {"dtype": float}})
+
+    assert "extra" in result.columns
+    assert result["price"].dtype == float
+
+
+def test_normalize_does_not_warn_when_columns_match():
+    import warnings
+
+    df = pd.DataFrame({"price": ["1.5"]})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        wasabi.normalize(df, {"price": {"dtype": float}})

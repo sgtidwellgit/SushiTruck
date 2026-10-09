@@ -12,6 +12,7 @@ import requests
 from . import gari, wasabi
 
 _RETRYABLE_STATUS = (429, 500, 502, 503, 504)
+_PAGINATION_STRATEGIES = ("auto", "page", "offset", "cursor", "link")
 
 
 def _dig(data: Any, dotted_key: str) -> Any:
@@ -23,6 +24,14 @@ def _dig(data: Any, dotted_key: str) -> Any:
             raise KeyError(f"results_key '{dotted_key}' not found in response (failed at '{part}').")
         value = value[part]
     return value
+
+
+def _next_cursor(body: Any) -> Any:
+    """Return the ``next_cursor`` / ``next_token`` value from a response body, if any."""
+
+    if isinstance(body, dict):
+        return body.get("next_cursor") or body.get("next_token")
+    return None
 
 
 class MakiClient:
@@ -85,6 +94,9 @@ class MakiClient:
             raise ValueError(f"Unsupported auth type: {self._auth.get('type')!r}")
 
     def _build_url(self, endpoint: str) -> str:
+        if endpoint.startswith(("http://", "https://")):
+            # Absolute URLs (e.g. a Link-header "next" page) are used as-is.
+            return endpoint
         return f"{self.base_url}/{endpoint.lstrip('/')}"
 
     def _auth_headers_and_params(self) -> tuple[dict[str, str], dict[str, Any]]:
@@ -156,9 +168,12 @@ class MakiClient:
         *,
         params: dict[str, Any] | None = None,
         paginate: bool = False,
+        pagination: str = "auto",
         page_param: str = "page",
-        page_size_param: str = "per_page",
+        page_size_param: str | None = None,
         page_size: int = 100,
+        offset_param: str = "offset",
+        cursor_param: str = "cursor",
         results_key: str | None = None,
     ) -> Any:
         """
@@ -167,92 +182,152 @@ class MakiClient:
         Parameters
         ----------
         endpoint
-            Path appended to ``base_url``.
+            Path appended to ``base_url``, or an absolute ``http(s)://`` URL.
         params
             Query parameters for the request.
         paginate
             Whether to keep requesting subsequent pages until exhausted.
-            Detects, in order: a ``next_cursor``/``next_token`` field in the
-            response body, a ``Link: <url>; rel="next"`` response header,
-            then falls back to incrementing ``page_param``.
+        pagination
+            Pagination strategy used when ``paginate=True``:
+
+            - ``"page"`` -- increment ``page_param`` (1, 2, 3, ...) until a
+              page returns no results.
+            - ``"offset"`` -- advance ``offset_param`` by ``page_size``
+              (0, 100, 200, ...) until a page returns fewer than
+              ``page_size`` results.
+            - ``"cursor"`` -- send the ``next_cursor`` / ``next_token`` value
+              from each response body back as ``cursor_param`` until a
+              response no longer carries one.
+            - ``"link"`` -- follow the ``Link: <url>; rel="next"`` response
+              header until it is absent.
+            - ``"auto"`` (default) -- start with page numbers, and switch to
+              cursor or Link-header following as soon as a response
+              carries a cursor or a ``rel="next"`` link.
         page_param
-            Query parameter name for the page number (page-number strategy).
+            Query parameter name for the page number (``"page"`` strategy).
         page_size_param
-            Query parameter name for the page size.
+            Query parameter name for the page size. Defaults to ``"limit"``
+            for the ``"offset"`` strategy and ``"per_page"`` otherwise.
         page_size
             Number of results requested per page.
+        offset_param
+            Query parameter name for the row offset (``"offset"`` strategy).
+        cursor_param
+            Query parameter name the cursor is sent back as (``"cursor"``
+            strategy, or ``"auto"`` once a cursor is seen).
         results_key
-            Dot-notation key path to extract the results list from each
-            page's JSON body (e.g. ``"data.items"``). If omitted, the whole
-            parsed body is treated as the results for that page.
+            Dot-notation key path to extract the results from the JSON body
+            (e.g. ``"data.items"``). Applied to every page when paginating.
+            If omitted, the whole parsed body is the result.
 
         Returns
         -------
         dict | list
-            The parsed JSON body (single request), or a concatenated list
-            of results across all pages (when ``paginate=True``).
+            The parsed JSON body (or the value at ``results_key``) for a
+            single request, or a concatenated list of results across all
+            pages when ``paginate=True``.
+
+        Raises
+        ------
+        ValueError
+            If ``pagination`` is not a supported strategy.
+        KeyError
+            If ``results_key`` is not present in a response body.
         """
 
         if not paginate:
-            response = self._request("GET", endpoint, params=params)
-            return response.json()
+            body = self._request("GET", endpoint, params=params).json()
+            return _dig(body, results_key) if results_key else body
+
+        if pagination not in _PAGINATION_STRATEGIES:
+            raise ValueError(
+                f"pagination must be one of {_PAGINATION_STRATEGIES}, got {pagination!r}"
+            )
 
         return self._get_paginated(
-            endpoint, params or {}, page_param, page_size_param, page_size, results_key
+            endpoint,
+            params or {},
+            strategy=pagination,
+            page_param=page_param,
+            page_size_param=page_size_param,
+            page_size=page_size,
+            offset_param=offset_param,
+            cursor_param=cursor_param,
+            results_key=results_key,
         )
 
     def _get_paginated(
         self,
         endpoint: str,
         params: dict[str, Any],
+        *,
+        strategy: str,
         page_param: str,
-        page_size_param: str,
+        page_size_param: str | None,
         page_size: int,
+        offset_param: str,
+        cursor_param: str,
         results_key: str | None,
     ) -> list[Any]:
+        size_param = page_size_param or ("limit" if strategy == "offset" else "per_page")
+        base_params = {**params, size_param: page_size}
+
         all_results: list[Any] = []
-        page_params = {**params, page_size_param: page_size}
+        mode = strategy
         page = 1
+        offset = 0
+        cursor: Any = None
         next_url: str | None = None
-        cursor_mode = False
 
         while True:
             if next_url is not None:
                 response = self._request("GET", next_url)
             else:
-                response = self._request("GET", endpoint, params={**page_params, page_param: page})
+                request_params = dict(base_params)
+                if mode in ("auto", "page"):
+                    request_params[page_param] = page
+                elif mode == "offset":
+                    request_params[offset_param] = offset
+                elif mode == "cursor" and cursor is not None:
+                    request_params[cursor_param] = cursor
+                response = self._request("GET", endpoint, params=request_params)
             body = response.json()
 
             page_results = _dig(body, results_key) if results_key else body
             if isinstance(page_results, list):
                 all_results.extend(page_results)
+                count = len(page_results)
             elif page_results:
                 all_results.append(page_results)
+                count = 1
+            else:
+                count = 0
 
-            cursor = None
-            if isinstance(body, dict):
-                cursor = body.get("next_cursor") or body.get("next_token")
+            if mode in ("auto", "cursor"):
+                cursor = _next_cursor(body)
+                if cursor:
+                    mode = "cursor"
+                    continue
+                if mode == "cursor":
+                    break
 
-            if cursor:
-                cursor_mode = True
-                page_params["cursor"] = cursor
-                next_url = None
-                continue
+            if mode in ("auto", "link"):
+                link_next = response.links.get("next", {}).get("url") if response.links else None
+                if link_next:
+                    mode = "link"
+                    next_url = link_next
+                    continue
+                if mode == "link":
+                    break
 
-            if cursor_mode:
-                # A cursor sequence was in progress and this page had none: done.
+            if count == 0:
                 break
-
-            link_next = response.links.get("next", {}).get("url") if response.links else None
-            if link_next:
-                next_url = link_next
-                continue
-
-            if not page_results:
-                break
-
-            next_url = None
-            page += 1
+            if mode == "offset":
+                if count < page_size:
+                    break
+                offset += page_size
+            else:
+                page += 1
 
         return all_results
 
@@ -291,6 +366,12 @@ class MakiClient:
         *,
         params: dict[str, Any] | None = None,
         paginate: bool = False,
+        pagination: str = "auto",
+        page_param: str = "page",
+        page_size_param: str | None = None,
+        page_size: int = 100,
+        offset_param: str = "offset",
+        cursor_param: str = "cursor",
         results_key: str | None = None,
         flatten: bool = True,
     ) -> pd.DataFrame:
@@ -299,6 +380,7 @@ class MakiClient:
 
         This is the highest-level read method: it calls :meth:`get`, then
         (by default) passes the results through :func:`sushitruck.wasabi.flatten`.
+        All pagination parameters have the same meaning as in :meth:`get`.
 
         Parameters
         ----------
@@ -308,8 +390,11 @@ class MakiClient:
             Query parameters for the request.
         paginate
             Whether to follow pagination and merge all pages.
+        pagination, page_param, page_size_param, page_size, offset_param, cursor_param
+            Pagination controls; see :meth:`get`.
         results_key
-            Dot-notation key path to extract the results list/object.
+            Dot-notation key path to extract the results list/object from
+            each response body.
         flatten
             Whether to flatten nested JSON into columns via
             :func:`sushitruck.wasabi.flatten`. If ``False``, results are
@@ -325,11 +410,14 @@ class MakiClient:
             endpoint,
             params=params,
             paginate=paginate,
-            results_key=None if paginate else results_key,
+            pagination=pagination,
+            page_param=page_param,
+            page_size_param=page_size_param,
+            page_size=page_size,
+            offset_param=offset_param,
+            cursor_param=cursor_param,
+            results_key=results_key,
         )
-
-        if not paginate and results_key:
-            data = _dig(data, results_key)
 
         if flatten:
             return wasabi.flatten(data)

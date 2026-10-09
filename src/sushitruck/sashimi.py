@@ -160,8 +160,8 @@ def read(
             )
         return _read_chunked_and_normalize(path, fmt, chunksize, storage, storage_options, schema, read_kwargs)
 
-    source = _open_source(path, storage, storage_options)
-    df = _read_full(source, fmt, **read_kwargs)
+    with _open_source(path, storage, storage_options) as source:
+        df = _read_full(source, fmt, **read_kwargs)
 
     if schema is not None:
         from . import wasabi
@@ -180,14 +180,13 @@ def _read_chunked_and_normalize(
     schema: dict[str, dict] | None,
     read_kwargs: dict[str, Any],
 ) -> Generator[pd.DataFrame, None, None]:
-    source = _open_source(path, storage, storage_options)
+    with _open_source(path, storage, storage_options) as source:
+        for chunk in _read_chunked(source, fmt, chunksize, **read_kwargs):
+            if schema is not None:
+                from . import wasabi
 
-    for chunk in _read_chunked(source, fmt, chunksize, **read_kwargs):
-        if schema is not None:
-            from . import wasabi
-
-            chunk = wasabi.normalize(chunk, schema)
-        yield chunk
+                chunk = wasabi.normalize(chunk, schema)
+            yield chunk
 
 
 def _list_local(prefix: str, pattern: str | None) -> list[str]:

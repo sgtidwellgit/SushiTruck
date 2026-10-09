@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from typing import Any
 
 import pandas as pd
@@ -122,7 +123,8 @@ def normalize(
         ``"default"`` (fill value applied before the nullable check).
     strict
         If ``True``, raise on columns present in ``df`` but absent from
-        ``schema``. If ``False``, extra columns are kept as-is.
+        ``schema``. If ``False``, extra columns are kept unchanged and a
+        ``UserWarning`` names them.
     coerce
         Whether to attempt dtype coercion per the schema's ``"dtype"`` spec.
 
@@ -137,11 +139,22 @@ def normalize(
         If ``strict=True`` and extra columns are present, if a schema column
         is missing from ``df``, or if a non-nullable column contains nulls
         after coercion and default-filling.
+
+    Warns
+    -----
+    UserWarning
+        If ``strict=False`` and ``df`` has columns absent from ``schema``.
     """
 
     extra_columns = set(df.columns) - set(schema)
     if strict and extra_columns:
         raise ValueError(f"Unexpected columns not in schema: {sorted(extra_columns)}")
+    if extra_columns:
+        warnings.warn(
+            f"Columns not in schema were kept unchanged: {sorted(extra_columns)}",
+            UserWarning,
+            stacklevel=2,
+        )
 
     missing_columns = set(schema) - set(df.columns)
     if missing_columns:

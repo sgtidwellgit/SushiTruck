@@ -101,13 +101,23 @@ class TemakiJob:
         params: dict[str, Any] | None = None,
         paginate: bool = False,
         results_key: str | None = None,
+        **fetch_kwargs: Any,
     ) -> "TemakiJob":
-        """Add a REST API endpoint as a source. Returns ``self`` for chaining."""
+        """
+        Add a REST API endpoint as a source. Returns ``self`` for chaining.
+
+        ``**fetch_kwargs`` (e.g. ``pagination="offset"``, ``page_size=500``)
+        are forwarded to :meth:`sushitruck.maki.MakiClient.fetch`.
+        """
 
         self._sources.append({
             "label": f"api:{endpoint}",
             "reader": lambda: client.fetch(
-                endpoint, params=params, paginate=paginate, results_key=results_key
+                endpoint,
+                params=params,
+                paginate=paginate,
+                results_key=results_key,
+                **fetch_kwargs,
             ),
         })
         return self

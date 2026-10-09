@@ -124,7 +124,7 @@ def send(
         ``"parquet"``, ``"csv"``, ``"json"``, or ``"jsonl"``.
     mode
         ``"overwrite"`` (default) or ``"append"``. Append is only supported
-        for ``csv``/``jsonl`` targets.
+        for local ``csv``/``jsonl`` targets; object stores have no append.
     partition_by
         Column name to partition output by by value, following the Hive
         convention (``target/col=value/part.<format>``). When set, ``target``
@@ -143,6 +143,11 @@ def send(
         raise ValueError(f"mode must be 'overwrite' or 'append', got {mode!r}")
 
     targets = [target] if isinstance(target, str) else list(target)
+
+    if mode == "append":
+        remote = [t for t in targets if _storage_of(t) != "local"]
+        if remote:
+            raise ValueError(f"mode='append' is only supported for local targets, not {remote}")
     start = time.perf_counter()
 
     targets_written: list[str] = []

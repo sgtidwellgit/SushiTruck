@@ -1,6 +1,6 @@
 # SushiTruck — Project Document
 
-> **Current version:** 0.2.0 | **Python:** ≥ 3.9 | **Status:** First real release
+> **Current version:** 0.2.2 | **Python:** ≥ 3.9 (CI: 3.9–3.13) | **Status:** Beta — all modules implemented
 
 ---
 
@@ -9,7 +9,7 @@
 1. [What SushiTruck Is](#what-sushitruck-is)
 2. [The Philosophy](#the-philosophy)
 3. [Current State](#current-state)
-4. [Repository Layout (Target)](#repository-layout-target)
+4. [Repository Layout](#repository-layout)
 5. [Dependency & Extras Architecture](#dependency--extras-architecture)
 6. [The Belt — All Planned Modules](#the-belt--all-planned-modules)
    - [`nigiri` — Streaming Source Adapters](#nigiri--streaming-source-adapters)
@@ -71,12 +71,14 @@ The guiding design values:
 | Item | Status |
 |---|---|
 | PyPI name `sushitruck` | Secured (2026-06-15) |
-| Version | 0.2.0 |
-| `src/sushitruck/__init__.py` | Exists — `__version__ = "0.2.0"`, exports all seven modules + `MakiClient`, `TemakiJob`, `TemakiResult`, `TobikoResult` |
+| Version | 0.2.2 |
+| `src/sushitruck/__init__.py` | Exists — `__version__ = "0.2.2"`, exports all seven modules + `MakiClient`, `TemakiJob`, `TemakiResult`, `TobikoResult` |
 | `pyproject.toml` | Exists — hatchling build, Python ≥ 3.9, MIT license, optional extras declared |
 | `README.md` | Exists — install, usage examples, fleet context |
 | All planned modules | Implemented: `gari`, `wasabi`, `maki`, `sashimi`, `tobiko`, `temaki`, `nigiri` |
-| Tests | 75 passing tests across all modules (`pytest`) |
+| Tests | 129 passing tests, 96% line coverage (`pytest`); cloud and queue backends tested offline against in-memory stand-ins in `tests/conftest.py` |
+| CI | `.github/workflows/tests.yml` — Python 3.9–3.13 on Linux, plus Windows and macOS; builds and checks distributions |
+| `LICENSE` | MIT |
 | Optional extras in `pyproject.toml` | Declared: `kafka`, `kinesis`, `cloud`, `websocket`, `all`, `dev` |
 | `py.typed` marker | Present (PEP 561) |
 | `CHANGELOG.md` | Present |
@@ -85,14 +87,16 @@ All seven modules are implemented and tested. `nigiri`'s WebSocket support ships
 
 ---
 
-## Repository Layout (Target)
+## Repository Layout
 
 ```
 SushiTruck/
 ├── pyproject.toml              # build config, metadata, optional extras
 ├── README.md                   # user-facing install and usage guide
 ├── PROJECT.md                  # this file — comprehensive project state + roadmap
-├── CHANGELOG.md                # per-version release notes (add before first real release)
+├── CHANGELOG.md                # per-version release notes
+├── LICENSE                     # MIT
+├── .github/workflows/tests.yml # CI: test matrix + package build check
 ├── src/
 │   └── sushitruck/
 │       ├── __init__.py         # public re-exports + __version__
@@ -102,8 +106,10 @@ SushiTruck/
 │       ├── wasabi.py           # JSON flattener + schema normalizer
 │       ├── gari.py             # rate limiter, retry logic, circuit breaker
 │       ├── temaki.py            # batch ingestion coordinator
-│       └── tobiko.py           # output router (file, queue, ThaiTruck handoff)
+│       ├── tobiko.py           # output router (local / S3 / GCS files, Kafka / Kinesis queues)
+│       └── results.py          # TemakiResult, TobikoResult
 └── tests/
+    ├── conftest.py             # in-memory stand-ins for boto3, google-cloud-storage, confluent-kafka
     ├── test_nigiri.py
     ├── test_maki.py
     ├── test_sashimi.py
@@ -128,11 +134,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev        = ["pytest>=7", "pytest-cov", "responses>=0.23"]
+dev        = ["pytest>=7", "pytest-cov", "responses>=0.23", "build", "twine"]
 kafka      = ["confluent-kafka>=2.0"]
 kinesis    = ["boto3>=1.26"]
 cloud      = ["boto3>=1.26", "google-cloud-storage>=2.0"]
-websocket  = ["websockets>=11.0"]
+websocket  = ["websockets>=14.0"]   # connect(additional_headers=...) needs 14+
 all        = ["sushitruck[kafka,kinesis,cloud,websocket]"]
 ```
 
@@ -169,8 +175,8 @@ except ImportError as e:
 ### `nigiri` — Streaming Source Adapters
 
 **File:** `src/sushitruck/nigiri.py`  
-**Core:** WebSocket support  
-**Optional extras:** `[kafka]` for Kafka, `[kinesis]` for Kinesis
+**Core:** webhook support  
+**Optional extras:** `[websocket]` for WebSocket, `[kafka]` for Kafka, `[kinesis]` for Kinesis
 
 Named for nigiri — one clean piece at a time, precisely placed. `nigiri` connects to a continuous streaming source and yields micro-batched DataFrames. The caller consumes them at their own pace with a `for` loop or `next()`.
 
@@ -320,13 +326,13 @@ class MakiClient:
 | `"api_key"` | Configurable header or query param (e.g., `X-API-Key`) |
 | `"oauth2"` | OAuth2 client-credentials flow (token refresh handled automatically) |
 
-**Pagination strategies** (auto-detected or specified):
+**Pagination strategies** (chosen with `pagination=`; `"auto"` by default):
 
 | Strategy | Detection | Behavior |
 |---|---|---|
 | Page-number | `?page=N` pattern | Increments page until empty results |
 | Cursor / token | `next_cursor` / `next_token` in response | Follows cursor until null |
-| Offset/limit | `?offset=N&limit=M` pattern | Increments offset by limit until empty |
+| Offset/limit | `pagination="offset"` | Increments offset by `page_size` until a short or empty page |
 | Link header | `Link: <url>; rel="next"` | Follows `next` link until absent |
 
 `fetch()` is the highest-level method — calls `get()` with optional pagination, passes results through `wasabi.flatten()`, and returns a single `pd.DataFrame`. This is the method most callers want.
@@ -577,7 +583,7 @@ clean = wasabi.normalize(df, schema, coerce=True)
 **File:** `src/sushitruck/gari.py`  
 **Core dependency:** stdlib only (`time`, `functools`, `threading`)
 
-Named for pickled ginger — the palate cleanser between pieces. `gari` is the reliability layer: rate limiting, retry with exponential backoff, and a circuit breaker. It is used internally by `maki` and `nigiri`, and is also available as a standalone decorator for any callable that touches an external service.
+Named for pickled ginger — the palate cleanser between pieces. `gari` is the reliability layer: rate limiting, retry with exponential backoff, and a circuit breaker. It is used internally by `maki`, and is also available as a standalone decorator for any callable that touches an external service.
 
 **Planned signatures:**
 
@@ -602,9 +608,10 @@ def my_api_call(): ...
 )
 def my_api_call(): ...
 
-# Composable: all three together
-@gari.rate_limit(calls_per_second=5.0)
+# Composable: all three together. retry goes on top so that every attempt,
+# including retries, passes through the rate limiter and the breaker below it.
 @gari.retry(max_attempts=4)
+@gari.rate_limit(calls_per_second=5.0)
 @gari.circuit_breaker(failure_threshold=10)
 def my_api_call(): ...
 
@@ -640,7 +647,7 @@ Three states:
 **Design notes:**
 
 - `rate_limit` uses wall-clock time (not a fixed window) — a token-bucket algorithm that smooths bursts rather than allowing all calls at the start of a window
-- All three decorators are composable and stack cleanly — apply outermost to innermost
+- All three decorators are composable. Order matters: `retry` must be outermost, or retries bypass the rate limiter (the outer wrapper only waits once)
 - Circuit breaker state is per-decorated-function and per-process (not shared across processes or threads unless a shared backend is added later)
 - `gari` has zero external dependencies — pure stdlib — so it is always available as part of the core install
 
@@ -649,7 +656,10 @@ Three states:
 ```python
 from sushitruck import gari
 
-@gari.retry(max_attempts=4, backoff_base=2.0, jitter=True, retry_on=(429, 500))
+# raise_for_status() turns 429/5xx into HTTPError, so retry on the exception type
+# (status codes in retry_on only match when the function returns the Response).
+@gari.retry(max_attempts=4, backoff_base=2.0, jitter=True,
+            retry_on=(requests.HTTPError, requests.ConnectionError))
 @gari.rate_limit(calls_per_second=5.0)
 def fetch_price(symbol: str) -> dict:
     response = requests.get(f"https://api.example.com/price/{symbol}")
@@ -739,7 +749,8 @@ job = (
     .add_file("local_overrides.csv")
 )
 
-df = job.run()
+result = job.run()      # TemakiResult
+df = result.df
 # or, memory-safe:
 for batch_df in job.stream():
     process(batch_df)
@@ -927,7 +938,7 @@ tobiko.send(merged, "s3://my-bucket/processed/merged.parquet",
 | Package | Status | Focus |
 |---|---|---|
 | **thaitruck** | Live on PyPI (v0.2.2) | Batch DataFrame cleaning, merging, profiling, caching |
-| **sushitruck** | PyPI name secured (v0.1.0 stub) | Streaming ingestion, REST API connectors, file reading, normalization, output routing |
+| **sushitruck** | Live on PyPI (v0.2.2) | Streaming ingestion, REST API connectors, file reading, normalization, output routing |
 | **ramentruck** | PyPI name secured (v0.1.0 stub) | ML/AI toolkit — training, tuning, cross-validation, explainability, deep learning |
 
 Each package is fully independent — none imports from another. They compose at the application layer through `pd.DataFrame`. SushiTruck produces them. ThaiTruck transforms them. RamenTruck models them. The user's code is the only thing that knows about all three.
@@ -936,7 +947,7 @@ Each package is fully independent — none imports from another. They compose at
 
 ## Build & Publish Plan
 
-### Before First Real Release (v0.2.0)
+### Before First Real Release (v0.2.0) — done
 
 1. Implement core modules: `wasabi`, `gari`, `maki`, `sashimi` (local files only)
 2. Add `tests/` — one file per module; use `responses` library to mock HTTP calls in `test_maki.py`
@@ -944,7 +955,7 @@ Each package is fully independent — none imports from another. They compose at
 4. Add import guards in `nigiri.py` (Kafka/Kinesis/WebSocket paths) and `sashimi.py` (S3/GCS paths)
 5. Add `py.typed` marker (PEP 561)
 6. Add `CHANGELOG.md`
-7. Add `.github/workflows/tests.yml` — pytest on Python 3.9/3.10/3.11/3.12
+7. Add `.github/workflows/tests.yml` — pytest on Python 3.9/3.10/3.11/3.12 *(added in 0.2.2, with 3.13 plus Windows and macOS)*
 
 ### Recommended implementation order
 
@@ -952,7 +963,7 @@ Each package is fully independent — none imports from another. They compose at
 2. `wasabi` — pandas only; needed by all other modules
 3. `maki` — builds on `gari`; most immediately useful
 4. `sashimi` (local only) — builds on `wasabi`; straightforward
-5. `tobiko` (local + ThaiTruck handoff) — completes the local pipeline
+5. `tobiko` (local output) — completes the local pipeline
 6. `temaki` — builds on `sashimi` and `maki`
 7. `nigiri` (WebSocket first, then Kafka/Kinesis) — streaming last; most complex
 
@@ -971,4 +982,4 @@ twine upload dist/*      # publish to PyPI
 
 ---
 
-*Last updated: 2026-07-31*
+*Last updated: 2026-10-09*
