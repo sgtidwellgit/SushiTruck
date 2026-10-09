@@ -1,6 +1,6 @@
 # SushiTruck — Project Document
 
-> **Current version:** 0.2.2 | **Python:** ≥ 3.9 (CI: 3.9–3.13) | **Status:** Beta — all modules implemented
+> **Current version:** 0.2.3 | **Python:** ≥ 3.9 (CI: 3.9–3.13) | **Status:** Beta — all modules implemented
 
 ---
 
@@ -71,8 +71,8 @@ The guiding design values:
 | Item | Status |
 |---|---|
 | PyPI name `sushitruck` | Secured (2026-06-15) |
-| Version | 0.2.2 |
-| `src/sushitruck/__init__.py` | Exists — `__version__ = "0.2.2"`, exports all seven modules + `MakiClient`, `TemakiJob`, `TemakiResult`, `TobikoResult` |
+| Version | 0.2.3 |
+| `src/sushitruck/__init__.py` | Exists — `__version__ = "0.2.3"`, exports all seven modules + `MakiClient`, `TemakiJob`, `TemakiResult`, `TobikoResult` |
 | `pyproject.toml` | Exists — hatchling build, Python ≥ 3.9, MIT license, optional extras declared |
 | `README.md` | Exists — install, usage examples, fleet context |
 | All planned modules | Implemented: `gari`, `wasabi`, `maki`, `sashimi`, `tobiko`, `temaki`, `nigiri` |
@@ -938,7 +938,7 @@ tobiko.send(merged, "s3://my-bucket/processed/merged.parquet",
 | Package | Status | Focus |
 |---|---|---|
 | **thaitruck** | Live on PyPI (v0.2.2) | Batch DataFrame cleaning, merging, profiling, caching |
-| **sushitruck** | Live on PyPI (v0.2.2) | Streaming ingestion, REST API connectors, file reading, normalization, output routing |
+| **sushitruck** | Live on PyPI (v0.2.3) | Streaming ingestion, REST API connectors, file reading, normalization, output routing |
 | **ramentruck** | PyPI name secured (v0.1.0 stub) | ML/AI toolkit — training, tuning, cross-validation, explainability, deep learning |
 
 Each package is fully independent — none imports from another. They compose at the application layer through `pd.DataFrame`. SushiTruck produces them. ThaiTruck transforms them. RamenTruck models them. The user's code is the only thing that knows about all three.
