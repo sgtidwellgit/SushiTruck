@@ -7,10 +7,13 @@ All notable changes to SushiTruck are documented here. The format follows [Keep 
 ### Fixed
 
 - The `[dev]` extra now installs `pyarrow`, so the Parquet tests pass in a fresh development environment (and in CI).
+- `nigiri.stream("webhook")` no longer does a reverse-DNS lookup of the bind address when the listener starts. Where reverse DNS is slow (common on macOS), startup took seconds, and events sent in the meantime were refused.
+- The webhook tests retry until the listener accepts connections instead of assuming a fixed startup time, so they can't hang on a slow machine.
 
 ### Changed
 
 - CI uses `actions/checkout@v5` and `actions/setup-python@v6`.
+- CI fails a stuck test after 120 seconds (via `pytest-timeout`, now in the `[dev]` extra) and a stuck job after 15 minutes, and prints each test name as it runs.
 
 ## [0.2.2] - 2026-10-09
 

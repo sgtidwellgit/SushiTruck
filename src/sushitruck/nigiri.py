@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import queue
+import socketserver
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -57,6 +58,24 @@ def _drain_queue(
             break
 
 
+class _WebhookServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer without the reverse-DNS lookup in ``server_bind``.
+
+    ``HTTPServer.server_bind`` calls ``socket.getfqdn()`` after binding but
+    before listening. Where reverse DNS is slow (common on macOS), that
+    delays startup by seconds, and connections in the meantime are refused.
+    The name is only used for display, so the bind host is used instead.
+    """
+
+    daemon_threads = True
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
+
+
 def _make_webhook_handler(path: str, q: "queue.Queue[Any]", deserializer: Callable[[bytes], Any]):
     class _Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802 (stdlib method name)
@@ -92,7 +111,7 @@ def _stream_webhook(
 
     path = config.get("path", "/ingest")
     handler = _make_webhook_handler(path, q, deserialize)
-    server = ThreadingHTTPServer((config.get("host", "0.0.0.0"), config.get("port", 8080)), handler)
+    server = _WebhookServer((config.get("host", "0.0.0.0"), config.get("port", 8080)), handler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 

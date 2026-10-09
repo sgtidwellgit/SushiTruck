@@ -9,6 +9,8 @@ jobs:
   test:
     name: Python ${{ matrix.python-version }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # The suite takes seconds; a hang should fail fast, not run for hours.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +36,9 @@ jobs:
           python -m pip install -e ".[dev,websocket]"
 
       - name: Test
-        run: python -m pytest --cov=sushitruck --cov-report=term-missing
+        # -v names each test as it runs; --timeout fails a stuck test and
+        # prints every thread's stack, so a hang identifies itself.
+        run: python -m pytest -v --timeout=120 --durations=10 --cov=sushitruck --cov-report=term-missing
 
   package:
     name: Build and check distributions

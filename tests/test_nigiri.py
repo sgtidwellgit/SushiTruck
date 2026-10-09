@@ -11,6 +11,19 @@ import requests
 from sushitruck import nigiri
 
 
+def _post(url: str, payload: dict) -> requests.Response:
+    """POST, retrying while the listener is still starting (connection refused)."""
+
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            return requests.post(url, json=payload, timeout=5)
+        except requests.ConnectionError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.05)
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("localhost", 0))
@@ -26,12 +39,12 @@ def test_webhook_stream_yields_posted_batches():
     port = _free_port()
     config = {"host": "127.0.0.1", "port": port, "path": "/ingest"}
 
-    gen = nigiri.stream("webhook", config=config, batch_size=2, timeout_ms=300, max_batches=1)
+    # A generous timeout so both messages land in one batch even on a slow machine.
+    gen = nigiri.stream("webhook", config=config, batch_size=2, timeout_ms=5000, max_batches=1)
 
     def post_messages():
-        time.sleep(0.2)
         for i in range(2):
-            requests.post(f"http://127.0.0.1:{port}/ingest", json={"i": i})
+            _post(f"http://127.0.0.1:{port}/ingest", {"i": i})
 
     threading.Thread(target=post_messages, daemon=True).start()
 
@@ -49,8 +62,7 @@ def test_webhook_stream_yields_partial_batch_on_timeout():
     gen = nigiri.stream("webhook", config=config, batch_size=100, timeout_ms=200, max_batches=1)
 
     def post_one():
-        time.sleep(0.1)
-        requests.post(f"http://127.0.0.1:{port}/ingest", json={"i": 1})
+        _post(f"http://127.0.0.1:{port}/ingest", {"i": 1})
 
     threading.Thread(target=post_one, daemon=True).start()
 
@@ -173,9 +185,8 @@ def test_webhook_ignores_unknown_paths():
     statuses = {}
 
     def post_messages():
-        time.sleep(0.2)
-        statuses["wrong"] = requests.post(f"http://127.0.0.1:{port}/elsewhere", json={"i": 0}).status_code
-        statuses["right"] = requests.post(f"http://127.0.0.1:{port}/ingest", json={"i": 1}).status_code
+        statuses["wrong"] = _post(f"http://127.0.0.1:{port}/elsewhere", {"i": 0}).status_code
+        statuses["right"] = _post(f"http://127.0.0.1:{port}/ingest", {"i": 1}).status_code
 
     threading.Thread(target=post_messages, daemon=True).start()
 
